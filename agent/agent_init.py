@@ -1355,10 +1355,20 @@ def init_agent(
     # to the main model). Set to a specific model name to offload summarization
     # to a smaller/faster model if desired.
     rolling_summary_model = _compression_cfg.get("rolling_summary_model", None)
+    # Max token budget for the lightweight rolling summary checkpoint.
+    # Default ~250 tokens keeps context near-constant without eating into
+    # the main conversation window. Overflow compression uses a separate,
+    # larger budget (~500+).
+    rolling_summary_max_tokens = _compression_cfg.get("rolling_summary_max_tokens", 250)
+    if rolling_summary_max_tokens is not None:
+        try:
+            rolling_summary_max_tokens = max(100, int(rolling_summary_max_tokens))
+        except (TypeError, ValueError):
+            rolling_summary_max_tokens = 250
 
     # Intra-turn rolling summary: when enabled alongside rolling_summary_enabled,
-    # runs a lightweight summarization pass inside the tool-calling loop (after N+
-    # iterations) to keep context bounded during long multi-step turns.
+    # runs a lightweight summarization pass inside the tool-calling loop to keep
+    # context bounded during long multi-step turns.
     intra_turn_min_iterations = max(
         1, int(_compression_cfg.get("intra_turn_min_iterations", 3))
     )
@@ -1590,6 +1600,7 @@ def init_agent(
             rolling_summary_enabled=rolling_summary_enabled,
             rolling_summary_recent_n=rolling_summary_recent_n,
             rolling_summary_model_override=rolling_summary_model,
+            rolling_summary_max_tokens=rolling_summary_max_tokens,
             intra_turn_min_iterations=intra_turn_min_iterations,
             intra_turn_context_threshold=intra_turn_context_threshold,
         )

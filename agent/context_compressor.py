@@ -687,6 +687,7 @@ class ContextCompressor(ContextEngine):
         rolling_summary_enabled: bool = False,
         rolling_summary_recent_n: int = 5,
         rolling_summary_model_override: str = None,
+        rolling_summary_max_tokens: int | None = None,
         intra_turn_min_iterations: int = 3,
         intra_turn_context_threshold: int | None = None,
     ):
@@ -758,9 +759,9 @@ class ContextCompressor(ContextEngine):
 
         # Intra-turn rolling summary configuration. When enabled alongside
         # rolling_summary_enabled, this runs a lightweight summarization pass
-        # inside the tool-calling loop (after N+ iterations) to keep context
-        # bounded during long multi-step turns. The existing threshold-based
-        # compression remains as a safety net for overflow.
+        # inside the tool-calling loop to keep context bounded during long
+        # multi-step turns. The existing threshold-based compression remains
+        # as a safety net for overflow.
         self.intra_turn_min_iterations = intra_turn_min_iterations
         # Token budget below which intra-turn rolling summary is skipped.
         # When None, defaults to 60% of context_length (more conservative than
@@ -769,6 +770,12 @@ class ContextCompressor(ContextEngine):
             self.intra_turn_context_threshold = intra_turn_context_threshold
         else:
             self.intra_turn_context_threshold = int(self.context_length * 0.60)
+
+        # Rolling summary token budget — how much space the rolling checkpoint
+        # may consume. Default ~250 tokens keeps context near-constant without
+        # eating into the main conversation window. Overflow compression uses a
+        # separate, larger budget (~500+).
+        self.rolling_summary_max_tokens = max(100, int(rolling_summary_max_tokens) if rolling_summary_max_tokens else 250)
 
         # Running summary text that accumulates across turns (cleared on reset)
         self._rolling_summary: Optional[str] = None
@@ -2469,20 +2476,22 @@ This compaction should PRIORITISE preserving all information related to the focu
         ``rolling_summary_recent_n``, default 5) into a running summary that is
         prepended after the system prompt.
 
-        When called from inside the tool loop with ``current_iteration > 0``,
-        this method also checks intra-turn conditions: it only runs when the
-        iteration count meets or exceeds ``intra_turn_min_iterations`` and the
-        estimated context size exceeds ``intra_turn_context_threshold``. This
-        prevents unnecessary LLM calls on short turns while still bounding
-        context during long multi-step tool execution.
+        Turn-boundary calls (``current_iteration == 0``): fire whenever context
+        exceeds ``intra_turn_context_threshold``, with no iteration gating. This
+        keeps context bounded at each new turn before tool loops begin.
 
-        The existing threshold-based compression remains as a safety net for
-        overflow when the rolling summary alone cannot keep context within bounds.
+        Intra-turn calls (``current_iteration > 0``): fire when context exceeds
+        the threshold, regardless of iteration count. The existing threshold-based
+        compression remains as a safety net for overflow.
+
+        Uses a dedicated lightweight prompt (~250 token target) that is faster
+        and briefer than the full overflow compression template — only retains
+        Active Task, Goal, Key Decisions, and Current State.
 
         Args:
             messages: Full message list including system prompt.
             current_iteration: Tool-loop iteration count (0 = prologue call, > 0
-                = intra-turn call). Used to gate on minimum iterations.
+                = intra-turn call).
 
         Returns:
             Modified message list with old turns replaced by rolling summary.
@@ -2492,13 +2501,16 @@ This compaction should PRIORITISE preserving all information related to the focu
         if not self.rolling_summary_enabled or len(messages) < 3:
             return messages
 
-        # Intra-turn gating: skip unless we've hit enough iterations and the
-        # context is large enough to warrant another summarization pass.
-        if current_iteration > 0:
-            if current_iteration < self.intra_turn_min_iterations:
+        # Estimate rough token count to decide whether summarization is needed.
+        rough_tokens = estimate_messages_tokens_rough(messages)
+
+        # Turn-boundary calls (current_iteration == 0): fire whenever context
+        # exceeds the threshold — no iteration gating, just size check.
+        if current_iteration == 0:
+            if rough_tokens < self.intra_turn_context_threshold:
                 return messages
-            # Estimate rough token count to avoid running on small turns.
-            rough_tokens = estimate_messages_tokens_rough(messages)
+        else:
+            # Intra-turn: only fire when context has grown past threshold.
             if rough_tokens < self.intra_turn_context_threshold:
                 return messages
 
@@ -2518,7 +2530,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Serialize old messages into text for summarization
         old_text = self._serialize_for_summary(old_messages)
 
-        # Build a concise rolling summary prompt
+        # Build a lightweight rolling summary prompt — separate from overflow
+        # compression. Target ~250 tokens, fewer sections, faster processing.
         try:
             from hermes_time import now as _hermes_now
             _today_str = _hermes_now().strftime("%Y-%m-%d")
@@ -2540,6 +2553,15 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "past-tense facts. Never leave finished work worded as still pending.\n\n"
             )
 
+        # Lightweight template — only the sections needed for continuity.
+        # Much shorter than overflow compression (~250 vs ~500+ tokens).
+        _sections = (
+            "## Active Task\n[Most recent unfulfilled user input]\n\n"
+            "## Goal\n[Overall objective]\n\n"
+            "## Key Decisions\n[Important technical decisions and why]\n\n"
+            "## Current State\n[Working directory, branch, modified files, running processes]"
+        )
+
         if self._rolling_summary:
             prompt = (
                 f"{preamble}"
@@ -2548,29 +2570,16 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "Update the rolling summary. PRESERVE all still-relevant information. "
                 "ADD new completed actions and decisions. Remove only clearly obsolete items. "
                 "CRITICAL: Update 'Active Task' to reflect the most recent unfulfilled input.\n\n"
-                "Use this structure:\n\n"
-                "## Active Task\n[Most recent unfulfilled user input]\n\n"
-                "## Goal\n[Overall objective]\n\n"
-                "## Completed Actions\n[Numered list of concrete actions with tool names]\n\n"
-                "## Key Decisions\n[Important technical decisions and why]\n\n"
-                "## Active State\n[Current working state — files, branches, processes]\n\n"
-                "## Blocked\n[Any blockers or unresolved issues]\n\n"
-                "## Resolved Questions\n[Questions already answered with answers]\n\n"
-                "Keep it concise but concrete. Target ~500 tokens max."
+                f"Use this structure:\n\n{_sections}\n\n"
+                f"Target ~{self.rolling_summary_max_tokens} tokens max. Keep it brief."
             )
         else:
             prompt = (
                 f"{preamble}"
                 f"TURNS TO SUMMARIZE:\n{old_text}\n\n"
                 "Create a concise running context checkpoint. Use this structure:\n\n"
-                "## Active Task\n[Most recent unfulfilled user input]\n\n"
-                "## Goal\n[Overall objective]\n\n"
-                "## Completed Actions\n[Numered list of concrete actions with tool names]\n\n"
-                "## Key Decisions\n[Important technical decisions and why]\n\n"
-                "## Active State\n[Current working state — files, branches, processes]\n\n"
-                "## Blocked\n[Any blockers or unresolved issues]\n\n"
-                "## Resolved Questions\n[Questions already answered with answers]\n\n"
-                "Keep it concise but concrete. Target ~500 tokens max."
+                f"{_sections}\n\n"
+                f"Target ~{self.rolling_summary_max_tokens} tokens max. Keep it brief."
             )
 
         # Call LLM for summarization
@@ -2585,7 +2594,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     "api_mode": self.api_mode,
                 },
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 800,
+                "max_tokens": max(150, int(self.rolling_summary_max_tokens * 1.3)),
             }
             if self.rolling_summary_model:
                 call_kwargs["model"] = self.rolling_summary_model

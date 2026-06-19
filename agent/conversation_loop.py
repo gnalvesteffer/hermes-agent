@@ -560,6 +560,19 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    # Turn-boundary rolling summary: before entering the tool-calling loop,
+    # check if context has grown past the threshold and compress old turns
+    # into a lightweight checkpoint. This keeps context near-constant at each
+    # new turn, complementing intra-turn compression below.
+    _compressor = getattr(agent, "context_compressor", None)
+    if (
+        _compressor is not None
+        and _compressor.rolling_summary_enabled
+    ):
+        messages = _compressor._apply_rolling_summary(
+            messages, current_iteration=0,
+        )
+
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
