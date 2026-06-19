@@ -687,6 +687,8 @@ class ContextCompressor(ContextEngine):
         rolling_summary_enabled: bool = False,
         rolling_summary_recent_n: int = 5,
         rolling_summary_model_override: str = None,
+        intra_turn_min_iterations: int = 3,
+        intra_turn_context_threshold: int | None = None,
     ):
         self.model = model
         self.base_url = base_url
@@ -753,6 +755,21 @@ class ContextCompressor(ContextEngine):
         self.rolling_summary_enabled = rolling_summary_enabled
         self.rolling_summary_recent_n = rolling_summary_recent_n
         self.rolling_summary_model = rolling_summary_model_override or ""
+
+        # Intra-turn rolling summary configuration. When enabled alongside
+        # rolling_summary_enabled, this runs a lightweight summarization pass
+        # inside the tool-calling loop (after N+ iterations) to keep context
+        # bounded during long multi-step turns. The existing threshold-based
+        # compression remains as a safety net for overflow.
+        self.intra_turn_min_iterations = intra_turn_min_iterations
+        # Token budget below which intra-turn rolling summary is skipped.
+        # When None, defaults to 60% of context_length (more conservative than
+        # the main threshold so it fires before overflow compression).
+        if intra_turn_context_threshold is not None:
+            self.intra_turn_context_threshold = intra_turn_context_threshold
+        else:
+            self.intra_turn_context_threshold = int(self.context_length * 0.60)
+
         # Running summary text that accumulates across turns (cleared on reset)
         self._rolling_summary: Optional[str] = None
 
@@ -2439,7 +2456,11 @@ This compaction should PRIORITISE preserving all information related to the focu
         return compressed
 
 
-    def _apply_rolling_summary(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _apply_rolling_summary(
+        self,
+        messages: List[Dict[str, Any]],
+        current_iteration: int = 0,
+    ) -> List[Dict[str, Any]]:
         """Apply per-turn rolling summarization to keep context near-constant size.
 
         When enabled (``compression.rolling_summary_enabled=true``), this method
@@ -2448,25 +2469,38 @@ This compaction should PRIORITISE preserving all information related to the focu
         ``rolling_summary_recent_n``, default 5) into a running summary that is
         prepended after the system prompt.
 
-        The algorithm:
-          1. Protect the last N user/assistant turns intact
-          2. Serialize older non-system messages into text
-          3. Call LLM to produce a concise running summary (preserving key facts,
-             decisions, file paths, and unresolved tasks)
-          4. Replace old messages with [system_prompt, rolling_summary, recent_messages]
+        When called from inside the tool loop with ``current_iteration > 0``,
+        this method also checks intra-turn conditions: it only runs when the
+        iteration count meets or exceeds ``intra_turn_min_iterations`` and the
+        estimated context size exceeds ``intra_turn_context_threshold``. This
+        prevents unnecessary LLM calls on short turns while still bounding
+        context during long multi-step tool execution.
 
         The existing threshold-based compression remains as a safety net for
         overflow when the rolling summary alone cannot keep context within bounds.
 
         Args:
             messages: Full message list including system prompt.
+            current_iteration: Tool-loop iteration count (0 = prologue call, > 0
+                = intra-turn call). Used to gate on minimum iterations.
 
         Returns:
             Modified message list with old turns replaced by rolling summary.
-            If summarization fails, returns original messages unchanged.
+            If summarization fails or conditions not met, returns original
+            messages unchanged.
         """
         if not self.rolling_summary_enabled or len(messages) < 3:
             return messages
+
+        # Intra-turn gating: skip unless we've hit enough iterations and the
+        # context is large enough to warrant another summarization pass.
+        if current_iteration > 0:
+            if current_iteration < self.intra_turn_min_iterations:
+                return messages
+            # Estimate rough token count to avoid running on small turns.
+            rough_tokens = estimate_messages_tokens_rough(messages)
+            if rough_tokens < self.intra_turn_context_threshold:
+                return messages
 
         # Determine how many recent messages to protect (user + assistant pairs).
         n_messages = len(messages)

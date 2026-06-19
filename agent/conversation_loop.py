@@ -4061,7 +4061,21 @@ def run_conversation(
                     # _flush_messages_to_session_db writes compressed messages
                     # to the new session (see preflight compression comment).
                     conversation_history = None
-                
+
+                # Intra-turn rolling summary: after N+ tool iterations and when
+                # context has grown past the intra-turn threshold, run a lightweight
+                # summarization pass to keep context bounded during long multi-step
+                # turns. This complements (not replaces) the threshold-based
+                # compression above — it fires earlier and more frequently but with
+                # a smaller budget so it doesn't compete with full compaction.
+                if (
+                    _compressor.rolling_summary_enabled
+                    and api_call_count >= _compressor.intra_turn_min_iterations
+                ):
+                    messages = _compressor._apply_rolling_summary(
+                        messages, current_iteration=api_call_count,
+                    )
+
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
                 

@@ -1356,6 +1356,21 @@ def init_agent(
     # to a smaller/faster model if desired.
     rolling_summary_model = _compression_cfg.get("rolling_summary_model", None)
 
+    # Intra-turn rolling summary: when enabled alongside rolling_summary_enabled,
+    # runs a lightweight summarization pass inside the tool-calling loop (after N+
+    # iterations) to keep context bounded during long multi-step turns.
+    intra_turn_min_iterations = max(
+        1, int(_compression_cfg.get("intra_turn_min_iterations", 3))
+    )
+    intra_turn_context_threshold = _compression_cfg.get(
+        "intra_turn_context_threshold", None
+    )
+    if intra_turn_context_threshold is not None:
+        try:
+            intra_turn_context_threshold = int(intra_turn_context_threshold)
+        except (TypeError, ValueError):
+            intra_turn_context_threshold = None
+
     # Read optional explicit context_length override for the auxiliary
     # compression model. Custom endpoints often cannot report this via
     # /models, so the startup feasibility check needs the config hint.
@@ -1575,6 +1590,8 @@ def init_agent(
             rolling_summary_enabled=rolling_summary_enabled,
             rolling_summary_recent_n=rolling_summary_recent_n,
             rolling_summary_model_override=rolling_summary_model,
+            intra_turn_min_iterations=intra_turn_min_iterations,
+            intra_turn_context_threshold=intra_turn_context_threshold,
         )
     agent.compression_enabled = compression_enabled
 
