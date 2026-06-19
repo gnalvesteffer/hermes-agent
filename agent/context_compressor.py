@@ -623,6 +623,7 @@ class ContextCompressor(ContextEngine):
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
+        self._rolling_summary = None
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Clear per-session compaction state at a real session boundary.
@@ -683,6 +684,9 @@ class ContextCompressor(ContextEngine):
         provider: str = "",
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
+        rolling_summary_enabled: bool = False,
+        rolling_summary_recent_n: int = 5,
+        rolling_summary_model_override: str = None,
     ):
         self.model = model
         self.base_url = base_url
@@ -742,6 +746,15 @@ class ContextCompressor(ContextEngine):
         self.awaiting_real_usage_after_compression = False
 
         self.summary_model = summary_model_override or ""
+
+        # Per-turn rolling summary configuration. When enabled, a lightweight
+        # summarization pass runs on every turn to keep context near-constant
+        # size. The existing threshold-based compression remains as safety net.
+        self.rolling_summary_enabled = rolling_summary_enabled
+        self.rolling_summary_recent_n = rolling_summary_recent_n
+        self.rolling_summary_model = rolling_summary_model_override or ""
+        # Running summary text that accumulates across turns (cleared on reset)
+        self._rolling_summary: Optional[str] = None
 
         # Stores the previous compaction summary for iterative updates
         self._previous_summary: Optional[str] = None
@@ -2424,3 +2437,158 @@ This compaction should PRIORITISE preserving all information related to the focu
             logger.info("Compression #%d complete", self.compression_count)
 
         return compressed
+
+
+    def _apply_rolling_summary(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Apply per-turn rolling summarization to keep context near-constant size.
+
+        When enabled (``compression.rolling_summary_enabled=true``), this method
+        runs on every turn *before* the threshold-based compression check. It
+        summarizes all messages except the most recent N (configurable via
+        ``rolling_summary_recent_n``, default 5) into a running summary that is
+        prepended after the system prompt.
+
+        The algorithm:
+          1. Protect the last N user/assistant turns intact
+          2. Serialize older non-system messages into text
+          3. Call LLM to produce a concise running summary (preserving key facts,
+             decisions, file paths, and unresolved tasks)
+          4. Replace old messages with [system_prompt, rolling_summary, recent_messages]
+
+        The existing threshold-based compression remains as a safety net for
+        overflow when the rolling summary alone cannot keep context within bounds.
+
+        Args:
+            messages: Full message list including system prompt.
+
+        Returns:
+            Modified message list with old turns replaced by rolling summary.
+            If summarization fails, returns original messages unchanged.
+        """
+        if not self.rolling_summary_enabled or len(messages) < 3:
+            return messages
+
+        # Determine how many recent messages to protect (user + assistant pairs).
+        n_messages = len(messages)
+        recent_count = min(self.rolling_summary_recent_n * 2, n_messages - 1)
+        if recent_count < 2:
+            recent_count = 2
+
+        split_idx = max(0, n_messages - recent_count)
+        old_messages = [m for m in messages[:split_idx] if m.get("role") != "system"]
+        recent_messages = messages[split_idx:]
+
+        if not old_messages:
+            return messages
+
+        # Serialize old messages into text for summarization
+        old_text = self._serialize_for_summary(old_messages)
+
+        # Build a concise rolling summary prompt
+        try:
+            from hermes_time import now as _hermes_now
+            _today_str = _hermes_now().strftime("%Y-%m-%d")
+        except Exception:
+            _today_str = ""
+
+        preamble = (
+            "You are a summarization agent maintaining a running context checkpoint. "
+            "Treat the conversation turns below as source material for a compact record. "
+            "Produce only the structured summary; do not add greetings or prefixes. "
+            "Write in the same language the user was using — do not translate to English. "
+            "NEVER include API keys, tokens, passwords, secrets, credentials, or connection "
+            "strings — replace any that appear with [REDACTED].\n"
+        )
+
+        if _today_str:
+            preamble += (
+                f"The current date is {_today_str}. Phrase completed actions as dated, "
+                "past-tense facts. Never leave finished work worded as still pending.\n\n"
+            )
+
+        if self._rolling_summary:
+            prompt = (
+                f"{preamble}"
+                f"EXISTING ROLLING SUMMARY:\n{self._rolling_summary}\n\n"
+                f"NEW TURNS TO INCORPORATE:\n{old_text}\n\n"
+                "Update the rolling summary. PRESERVE all still-relevant information. "
+                "ADD new completed actions and decisions. Remove only clearly obsolete items. "
+                "CRITICAL: Update 'Active Task' to reflect the most recent unfulfilled input.\n\n"
+                "Use this structure:\n\n"
+                "## Active Task\n[Most recent unfulfilled user input]\n\n"
+                "## Goal\n[Overall objective]\n\n"
+                "## Completed Actions\n[Numered list of concrete actions with tool names]\n\n"
+                "## Key Decisions\n[Important technical decisions and why]\n\n"
+                "## Active State\n[Current working state — files, branches, processes]\n\n"
+                "## Blocked\n[Any blockers or unresolved issues]\n\n"
+                "## Resolved Questions\n[Questions already answered with answers]\n\n"
+                "Keep it concise but concrete. Target ~500 tokens max."
+            )
+        else:
+            prompt = (
+                f"{preamble}"
+                f"TURNS TO SUMMARIZE:\n{old_text}\n\n"
+                "Create a concise running context checkpoint. Use this structure:\n\n"
+                "## Active Task\n[Most recent unfulfilled user input]\n\n"
+                "## Goal\n[Overall objective]\n\n"
+                "## Completed Actions\n[Numered list of concrete actions with tool names]\n\n"
+                "## Key Decisions\n[Important technical decisions and why]\n\n"
+                "## Active State\n[Current working state — files, branches, processes]\n\n"
+                "## Blocked\n[Any blockers or unresolved issues]\n\n"
+                "## Resolved Questions\n[Questions already answered with answers]\n\n"
+                "Keep it concise but concrete. Target ~500 tokens max."
+            )
+
+        # Call LLM for summarization
+        try:
+            call_kwargs = {
+                "task": "compression",
+                "main_runtime": {
+                    "model": self.model,
+                    "provider": self.provider,
+                    "base_url": self.base_url,
+                    "api_key": self.api_key,
+                    "api_mode": self.api_mode,
+                },
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 800,
+            }
+            if self.rolling_summary_model:
+                call_kwargs["model"] = self.rolling_summary_model
+
+            response = call_llm(**call_kwargs)
+            content = response.choices[0].message.content
+            if not isinstance(content, str):
+                content = str(content) if content else ""
+
+            summary_text = redact_sensitive_text(content.strip())
+            # Empty summary is a failure — keep full context instead of replacing with blank
+            if not summary_text:
+                logger.debug(
+                    "Rolling summary produced empty output (will keep full context)",
+                    exc_info=True,
+                )
+                return messages
+
+            self._rolling_summary = summary_text
+
+        except Exception as e:
+            logger.debug(
+                "Rolling summary failed (will keep full context): %s", e, exc_info=True
+            )
+            return messages
+
+        # Build new message list: system_prompt + rolling_summary + recent_messages
+        new_messages = []
+        for msg in messages[:split_idx]:
+            if msg.get("role") == "system":
+                new_messages.append(msg)
+
+        new_messages.append({
+            "role": "user",
+            "content": f"[CONTEXT CHECKPOINT — generated by per-turn rolling summary]\n\n{self._rolling_summary}",
+        })
+
+        new_messages.extend(recent_messages)
+
+        return new_messages

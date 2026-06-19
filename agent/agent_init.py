@@ -1326,6 +1326,22 @@ def init_agent(
         _compression_cfg.get("abort_on_summary_failure", False)
     ).lower() in {"true", "1", "yes"}
 
+    # Per-turn rolling summary: lightweight summarization on every turn,
+    # keeping context near-constant size. Disabled by default for backward
+    # compatibility. When enabled, older turns are summarized into a running
+    # summary while protecting the most recent N messages intact. The existing
+    # threshold-based compression remains as a safety net for overflow.
+    rolling_summary_enabled = str(
+        _compression_cfg.get("rolling_summary_enabled", False)
+    ).lower() in {"true", "1", "yes"}
+    rolling_summary_recent_n = max(
+        1, int(_compression_cfg.get("rolling_summary_recent_n", 5))
+    )
+    # Model to use for per-turn summarization. Defaults to None (falls back
+    # to the main model). Set to a specific model name to offload summarization
+    # to a smaller/faster model if desired.
+    rolling_summary_model = _compression_cfg.get("rolling_summary_model", None)
+
     # Read optional explicit context_length override for the auxiliary
     # compression model. Custom endpoints often cannot report this via
     # /models, so the startup feasibility check needs the config hint.
@@ -1542,6 +1558,9 @@ def init_agent(
             provider=agent.provider,
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
+            rolling_summary_enabled=rolling_summary_enabled,
+            rolling_summary_recent_n=rolling_summary_recent_n,
+            rolling_summary_model_override=rolling_summary_model,
         )
     agent.compression_enabled = compression_enabled
 

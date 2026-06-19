@@ -247,6 +247,10 @@ def build_turn_context(
             exc_info=True,
         )
 
+    # ── Per-turn rolling summary (optional, keeps context near-constant) ──
+    if getattr(agent.context_compressor, "rolling_summary_enabled", False):
+        messages = agent.context_compressor._apply_rolling_summary(messages)
+
     # ── Preflight context compression ──
     if (
         agent.compression_enabled
