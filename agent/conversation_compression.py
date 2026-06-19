@@ -50,6 +50,13 @@ COMPACTION_STATUS = (
     f"🗜️ {COMPACTION_STATUS_MARKER} — summarizing earlier conversation so I can continue..."
 )
 
+# Rolling summary marker — same pattern as COMPACTION_STATUS for the gateway
+# to match and re-tag with kind="rolling_summary".
+ROLLING_SUMMARY_STATUS_MARKER = "Rolling compression"
+ROLLING_SUMMARY_STATUS = (
+    f"🔄 {ROLLING_SUMMARY_STATUS_MARKER} — summarizing older turns into a running checkpoint..."
+)
+
 
 def _compression_lock_holder(agent: Any) -> str:
     """Build a unique holder id for the lock: pid:tid:agent-instance:uuid.

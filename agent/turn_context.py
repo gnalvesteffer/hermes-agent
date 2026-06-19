@@ -249,7 +249,12 @@ def build_turn_context(
 
     # ── Per-turn rolling summary (optional, keeps context near-constant) ──
     if getattr(agent.context_compressor, "rolling_summary_enabled", False):
+        from agent.conversation_compression import ROLLING_SUMMARY_STATUS
+
+        pre_rolling_count = len(messages)
         messages = agent.context_compressor._apply_rolling_summary(messages)
+        if len(messages) != pre_rolling_count:
+            agent._emit_status(ROLLING_SUMMARY_STATUS)
 
     # ── Preflight context compression ──
     if (

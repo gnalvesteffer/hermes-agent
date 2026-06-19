@@ -763,9 +763,14 @@ def _status_update(sid: str, kind: str, text: str | None = None):
     # drivers (desktop app) can show an explicit "Summarizing…" indicator —
     # otherwise a mid-turn compaction looks like the transcript reset itself.
     if out_kind == "lifecycle":
-        from agent.conversation_compression import COMPACTION_STATUS_MARKER
+        from agent.conversation_compression import (
+            COMPACTION_STATUS_MARKER,
+            ROLLING_SUMMARY_STATUS_MARKER,
+        )
 
-        if COMPACTION_STATUS_MARKER in body:
+        if ROLLING_SUMMARY_STATUS_MARKER in body:
+            out_kind = "rolling_summary"
+        elif COMPACTION_STATUS_MARKER in body:
             out_kind = "compacting"
     _emit("status.update", sid, {"kind": out_kind, "text": body})
 

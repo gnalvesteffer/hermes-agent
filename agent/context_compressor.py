@@ -2571,6 +2571,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 return messages
 
             self._rolling_summary = summary_text
+            logger.debug("Rolling summary checkpoint updated (%d chars)", len(summary_text))
 
         except Exception as e:
             logger.debug(
