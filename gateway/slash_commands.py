@@ -567,6 +567,56 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    async def _handle_context_command(self, event: MessageEvent) -> str:
+        """Handle /context command — display the current context document."""
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        session_key = session_entry.session_id
+
+        # Try to get the running agent's compressor first.
+        status_agent = self._running_agents.get(session_key)
+        if status_agent is None:
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            cache = getattr(self, "_agent_cache", None)
+            if cache_lock is not None and cache is not None:
+                try:
+                    with cache_lock:
+                        cached = cache.get(session_key)
+                    if cached:
+                        status_agent = cached[0]
+                except Exception:
+                    pass
+
+        ctx = getattr(status_agent, "context_compressor", None) if status_agent else None
+        context_doc = ""
+        rolling_summary = ""
+        if ctx is not None:
+            context_doc = getattr(ctx, "context_doc", "") or ""
+            rolling_summary = getattr(ctx, "_rolling_summary", "") or ""
+
+        lines = ["## Context Document"]
+        if context_doc:
+            # Truncate to avoid flooding the chat with huge dumps.
+            max_chars = 8000
+            if len(context_doc) > max_chars:
+                lines.append(f"*(truncated at {max_chars} chars — full doc is longer)*\n")
+                lines.append(context_doc[:max_chars])
+            else:
+                lines.append(context_doc)
+        else:
+            lines.append("(empty — no context document yet)")
+
+        if rolling_summary:
+            lines.extend(["", "## Rolling Summary (per-turn checkpoint)", ""])
+            max_rs = 4000
+            if len(rolling_summary) > max_rs:
+                lines.append(f"*(truncated at {max_rs} chars)*\n")
+                lines.append(rolling_summary[:max_rs])
+            else:
+                lines.append(rolling_summary)
+
+        return "\n".join(lines)
+
     @staticmethod
     def _redact_matrix_session_key(session_key: str) -> str:
         """Return a stable Matrix session-key fingerprint for shared room status."""
