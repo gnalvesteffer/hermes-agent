@@ -591,14 +591,18 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
 
 
 class ContextCompressor(ContextEngine):
-    """Default context engine — compresses conversation context via lossy summarization.
+    """Default context engine — maintains a single rolling context document.
 
     Algorithm:
-      1. Prune old tool results (cheap, no LLM call)
-      2. Protect head messages (system prompt + first exchange)
-      3. Protect tail messages by token budget (most recent ~20K tokens)
-      4. Summarize middle turns with structured LLM prompt
-      5. On subsequent compactions, iteratively update the previous summary
+      1. After each turn/intra-turn, generate a quick summary of recent activity
+      2. Merge the summary into a single ``context_doc`` string (iterative update)
+      3. API calls always send: system + [user message = context_doc + recent_tool_results + latest_user_msg]
+      4. No growing message list — context stays nearly constant size
+
+    This replaces the old threshold-gated compression model where messages were
+    appended turn-by-turn and middle turns were summarized only when a token
+    threshold was hit. The single-context approach eliminates context rot, keeps
+    payload size predictable, and avoids long-running summarization on large contexts.
     """
 
     @property
@@ -640,6 +644,284 @@ class ContextCompressor(ContextEngine):
         owning session ends.
         """
         self._previous_summary = None
+
+    def update_context_doc(
+        self,
+        recent_activity: str,
+        *,
+        tool_results: list[dict[str, Any]] | None = None,
+        focus_topic: str | None = None,
+    ) -> str:
+        """Update the single context document with recent activity.
+
+        Generates a quick summary of recent turns/tool calls and merges it into
+        ``self.context_doc`` using iterative update (preserves existing info,
+        adds new progress). This is called after every turn and intra-turn step
+        to keep context nearly constant size.
+
+        Args:
+            recent_activity: Serialized representation of recent messages/turns
+                to summarize (e.g., assistant response + tool calls/results).
+            tool_results: Optional list of raw tool result dicts for inclusion
+                in the context doc so the model can reference exact outputs.
+            focus_topic: Optional focus string for guided summarization.
+
+        Returns:
+            The updated ``context_doc`` string.
+        """
+        if not recent_activity.strip():
+            return self.context_doc
+
+        # Build a quick summary using the existing _generate_summary infrastructure
+        # but with a simpler, faster prompt optimized for intra-turn updates.
+        try:
+            summary = self._generate_context_update(
+                recent_activity, focus_topic=focus_topic,
+            )
+        except Exception as e:
+            logger.debug("Context doc update failed (will use raw activity): %s", e)
+            # Fallback: just append the raw activity as a bullet point
+            summary = f"Recent activity:\n{recent_activity[:2000]}"
+
+        if not summary:
+            return self.context_doc
+
+        # Merge into existing context_doc (iterative update)
+        if self.context_doc:
+            merged = self._merge_context_updates(self.context_doc, summary)
+        else:
+            merged = summary
+
+        self.context_doc = merged
+
+        # Update recent tool results buffer
+        if tool_results:
+            for tr in tool_results:
+                self.recent_tool_results.append(tr)
+            # Keep only the last N results
+            while len(self.recent_tool_results) > self._max_recent_tool_results:
+                self.recent_tool_results.pop(0)
+
+        return self.context_doc
+
+    def get_api_user_message(self, latest_user_msg: str) -> str:
+        """Build the user message for API calls.
+
+        Combines context_doc + recent_tool_results + latest_user_msg into a single
+        user message that gets sent on every API call (alongside system prompt).
+
+        Args:
+            latest_user_msg: The current turn's user input.
+
+        Returns:
+            Combined string for the user message role.
+        """
+        parts = []
+
+        # Context document (summarized history)
+        if self.context_doc:
+            parts.append(
+                "## Prior Work Summary\n"
+                "The following is a summary of work done in this session so far.\n"
+                f"{self.context_doc}\n"
+            )
+
+        # Recent raw tool results (for direct model reference)
+        if self.recent_tool_results:
+            parts.append("## Recent Tool Results\n")
+            for tr in self.recent_tool_results[-self._max_recent_tool_results:]:
+                tool_name = tr.get("tool", "unknown")
+                result_text = tr.get("result", "")[:3000]  # cap each result
+                parts.append(f"- **{tool_name}**: {result_text}\n")
+
+        # Latest user message (always at the end)
+        parts.append(latest_user_msg)
+
+        return "\n\n".join(parts)
+
+    def _generate_context_update(
+        self,
+        recent_activity: str,
+        *,
+        focus_topic: str | None = None,
+    ) -> str | None:
+        """Generate a quick context update from recent activity.
+
+        Uses the existing auxiliary LLM infrastructure but with a simpler,
+        faster prompt optimized for iterative updates rather than full compression.
+
+        Args:
+            recent_activity: Serialized recent messages/turns to summarize.
+            focus_topic: Optional focus string.
+
+        Returns:
+            Summary string or None on failure.
+        """
+        now = time.monotonic()
+        if now < self._summary_failure_cooldown_until:
+            return None
+
+        # Use a smaller budget for quick updates (faster, less token-heavy)
+        summary_budget = min(500, self.max_summary_tokens or 500)
+
+        try:
+            from hermes_time import now as _hermes_now
+            _today_str = _hermes_now().strftime("%Y-%m-%d")
+        except Exception:
+            _today_str = ""
+
+        preamble = (
+            "You are a summarization agent creating a quick context checkpoint. "
+            "Treat the activity below as source material for a compact record of recent work. "
+            "Produce only the structured summary; do not add a greeting, preamble, or prefix. "
+            "Write in the same language used in the activity — do not translate to English. "
+            "NEVER include API keys, tokens, passwords, secrets, credentials, or connection strings — replace with [REDACTED]."
+        )
+
+        temporal_rule = ""
+        if _today_str:
+            temporal_rule = (
+                f"\nTEMPORAL ANCHORING: The current date is {_today_str}. "
+                "Phrase completed actions as dated, past-tense facts. "
+                'Example: rewrite "email John" as "Sent email to John on {_today_str}." '
+                "Never invent dates for work not yet done.\n"
+            )
+
+        template = f"""{preamble}
+
+Update the context checkpoint with this recent activity. Preserve all existing relevant information from the current checkpoint. Add new completed actions, update progress, and remove only clearly obsolete items.
+
+CURRENT CHECKPOINT:
+{self.context_doc if self.context_doc else "(empty — first update)"}
+
+RECENT ACTIVITY TO INCORPORATE:
+{recent_activity[:8000]}  # cap to keep prompt manageable
+
+Update the checkpoint using this structure (keep it concise):
+
+## Active Task
+[Most recent unfulfilled user input or task. Write "None" if fully resolved.]
+
+## Completed Actions
+[Numbered list of concrete actions taken since last update. Format: N. ACTION target — outcome]
+
+## Active State
+[Current working state — files, branch, environment, running processes]
+
+## In Progress
+[Work currently underway]
+
+## Blocked
+[Any blockers or errors]
+
+## Key Decisions
+[Important technical decisions and why]
+
+{temporal_rule}Target ~{summary_budget} tokens. Be concrete but concise — include file paths, specific values, and outcomes. Omit verbose explanations."""
+
+        if focus_topic:
+            template += (
+                f"\n\nFOCUS TOPIC: \"{focus_topic}\". Prioritize preserving information "
+                f"related to this topic."
+            )
+
+        try:
+            call_kwargs = {
+                "task": "compression",
+                "main_runtime": {
+                    "model": self.model,
+                    "provider": self.provider,
+                    "base_url": self.base_url,
+                    "api_key": self.api_key,
+                    "api_mode": self.api_mode,
+                },
+                "messages": [{"role": "user", "content": template}],
+                "max_tokens": int(summary_budget * 1.5),
+            }
+            if self.summary_model:
+                call_kwargs["model"] = self.summary_model
+
+            from agent.auxiliary_client import call_llm
+            response = call_llm(**call_kwargs)
+            content = response.choices[0].message.content
+            if not isinstance(content, str):
+                content = str(content) if content else ""
+
+            # Redact sensitive info from summary output
+            from agent.context_compressor import redact_sensitive_text
+            return redact_sensitive_text(content.strip())
+
+        except RuntimeError:
+            self._summary_failure_cooldown_until = time.monotonic() + 30
+            logger.debug("Context doc update: no provider available")
+            return None
+        except Exception as e:
+            # Short cooldown for transient errors
+            self._summary_failure_cooldown_until = time.monotonic() + 30
+            logger.debug("Context doc update failed: %s", e)
+            return None
+
+    def _merge_context_updates(self, existing: str, new_update: str) -> str:
+        """Merge a new context update into the existing context document.
+
+        Preserves all existing information that is still relevant, adds new progress,
+        and removes only clearly obsolete items. This is an iterative update — not
+        a full re-summarization.
+
+        Args:
+            existing: The current context_doc string.
+            new_update: The fresh summary of recent activity.
+
+        Returns:
+            Merged context document string.
+        """
+        # Simple merge: keep existing structure, append new completed actions
+        # and update active state from the new update.
+        # For a more sophisticated merge, we could parse sections and diff them,
+        # but for now a simple concatenation with section headers works well enough
+        # since the LLM-generated updates are already structured.
+
+        # Extract key sections from existing and new
+        existing_sections = {}
+        new_sections = {}
+
+        current_section = "header"
+        for line in (existing + "\n").split("\n"):
+            if line.startswith("## "):
+                current_section = line.strip()
+                existing_sections[current_section] = ""
+            elif current_section in existing_sections:
+                existing_sections[current_section] += line + "\n"
+
+        current_section = "header"
+        for line in (new_update + "\n").split("\n"):
+            if line.startswith("## "):
+                current_section = line.strip()
+                new_sections[current_section] = ""
+            elif current_section in new_sections:
+                new_sections[current_section] += line + "\n"
+
+        # Merge: keep existing sections, overlay new ones where they exist
+        merged_sections = {}
+        all_keys = set(existing_sections.keys()) | set(new_sections.keys())
+
+        for key in sorted(all_keys):
+            if key == "header":
+                continue  # skip any header text
+            if key in new_sections and new_sections[key].strip():
+                # New update has content — use it (it's more recent)
+                merged_sections[key] = new_sections[key]
+            elif key in existing_sections:
+                # Keep existing
+                merged_sections[key] = existing_sections[key]
+
+        # Build final document
+        result_parts = []
+        for section, content in merged_sections.items():
+            if content.strip():
+                result_parts.append(f"{section}\n{content}")
+
+        return "\n\n".join(result_parts)
 
     def update_model(
         self,
@@ -804,6 +1086,18 @@ class ContextCompressor(ContextEngine):
         # succeeded.  Silent recovery would hide the broken config.
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
+
+        # ── Single-context document fields (new model) ────────────────
+        # context_doc is a single string that summarizes all prior work.
+        # It gets updated after every turn/intra-turn via _update_context_doc().
+        # API calls always send: system + [user message = context_doc + recent_tool_results + latest_user_msg]
+        self.context_doc: str = ""
+        # Small buffer of raw tool results (last N) so the model can reference exact outputs.
+        # Kept separate from context_doc because the model needs direct access to actual values.
+        self.recent_tool_results: list[dict[str, Any]] = []  # [{"tool": name, "result": str}, ...]
+        self._max_recent_tool_results: int = 3
+        # Track whether we've done an initial context_doc setup for this session
+        self._context_doc_initialized: bool = False
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""

@@ -866,6 +866,52 @@ def run_conversation(
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
 
+        # ── Single-context document compression (if available) ───────
+        # Replace the full conversation history with a single compressed
+        # user message built from context_doc + recent_tool_results +
+        # latest_user_msg.  This keeps API payload size constant across
+        # turns and eliminates context rot from accumulated messages.
+        _compressor = getattr(agent, "context_compressor", None)
+        if (
+            _compressor is not None
+            and hasattr(_compressor, "get_api_user_message")
+            and callable(getattr(_compressor, "get_api_user_message"))
+        ):
+            # Find the latest user message from the original messages list.
+            # If none exists yet (first turn), use a placeholder.
+            _latest_user_msg = None
+            for _m in reversed(messages):
+                if isinstance(_m, dict) and _m.get("role") == "user":
+                    _latest_user_msg = _m.get("content", "")
+                    break
+            if _latest_user_msg is None:
+                _latest_user_msg = ""
+
+            # Build the compressed single-user-message.
+            try:
+                _compressed_user = _compressor.get_api_user_message(_latest_user_msg)
+            except Exception as _ctx_err:
+                logger.debug("Context compression failed (non-fatal): %s", _ctx_err)
+                _compressed_user = None
+
+            if isinstance(_compressed_user, str) and _compressed_user.strip():
+                # Determine where conversation history starts in api_messages.
+                # System message is at index 0; prefill messages follow it.
+                _history_start = 1
+                if (api_messages and api_messages[0].get("role") == "system"):
+                    _history_start = 1
+                    # Skip past any prefill messages that were inserted after system
+                    for _pi in range(1, len(api_messages)):
+                        pm = api_messages[_pi]
+                        if isinstance(pm, dict) and pm.get("_prefill", False):
+                            _history_start = _pi + 1
+                        else:
+                            break
+
+                # Replace all history messages with the single compressed user message.
+                api_messages = api_messages[:_history_start]
+                api_messages.append({"role": "user", "content": _compressed_user})
+
         # Calculate approximate request size for logging
         total_chars = sum(len(str(msg)) for msg in api_messages)
         approx_tokens = estimate_messages_tokens_rough(api_messages)
@@ -881,6 +927,18 @@ def run_conversation(
             failed = True
             _turn_exit_reason = "ollama_runtime_context_too_small"
             messages.append({"role": "assistant", "content": final_response})
+
+            # Update context_doc with the error so it persists across turns.
+            _compressor = getattr(agent, "context_compressor", None)
+            if _compressor is not None and hasattr(_compressor, "update_context_doc"):
+                try:
+                    _compressor.update_context_doc(
+                        f"Error: {final_response}",
+                        focus_topic=focus_topic if 'focus_topic' in locals() else None,
+                    )
+                except Exception as _ctx_err:
+                    logger.debug("Context doc update on ollama error failed (non-fatal): %s", _ctx_err)
+
             agent._emit_status("❌ Ollama runtime context is too small for Hermes tool use")
             api_call_count -= 1
             agent._api_call_count = api_call_count
@@ -4026,7 +4084,50 @@ def run_conversation(
                 _tc_names = {tc.function.name for tc in assistant_message.tool_calls}
                 if _tc_names == {"execute_code"}:
                     agent.iteration_budget.refund()
-                
+
+                # ── Single-context document update (new model) ────────────
+                # After each tool execution, summarize the assistant response
+                # + tool results into context_doc so the next API call uses a
+                # constant-size payload instead of a growing message list.
+                _compressor = agent.context_compressor
+                try:
+                    # Extract recent tool result messages from the tail of messages
+                    _tool_results_for_context = []
+                    for msg in reversed(messages[-20:]):  # scan last 20 for tool results
+                        if isinstance(msg, dict) and msg.get("role") == "tool":
+                            _tool_results_for_context.append({
+                                "tool": msg.get("name", "unknown"),
+                                "result": msg.get("content", "")[:3000],
+                            })
+                    # Build activity string: assistant response + tool results
+                    _activity_parts = []
+                    if assistant_message.content:
+                        _act_content = assistant_message.content or ""
+                        if isinstance(_act_content, list):
+                            for part in _act_content:
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    _act_text = part.get("text", "")
+                                    if _act_text:
+                                        _activity_parts.append(f"Assistant: {_act_text}")
+                        elif _act_content.strip():
+                            _activity_parts.append(f"Assistant: {_act_content[:2000]}")
+                    for tc in assistant_message.tool_calls or []:
+                        _activity_parts.append(
+                            f"Tool call: {tc.function.name}({tc.function.arguments[:500]})"
+                        )
+                    if _tool_results_for_context:
+                        for tr in reversed(_tool_results_for_context):
+                            _activity_parts.append(f"Result [{tr['tool']}]: {tr['result'][:1000]}")
+
+                    if _activity_parts:
+                        _compressor.update_context_doc(
+                            "\n".join(_activity_parts),
+                            tool_results=_tool_results_for_context,
+                            focus_topic=focus_topic if 'focus_topic' in locals() else None,
+                        )
+                except Exception as _ctx_err:
+                    logger.debug("Context doc update after tools failed (non-fatal): %s", _ctx_err)
+
                 # Use real token counts from the API response to decide
                 # compression.  prompt_tokens + completion_tokens is the
                 # actual context size the provider reported plus the
@@ -4425,7 +4526,29 @@ def run_conversation(
                     messages.pop()
 
                 messages.append(final_msg)
-                
+
+                # ── Single-context document update (final turn summary) ───
+                # Summarize the entire turn into context_doc so the session's
+                # state is captured in a constant-size document.
+                _compressor = agent.context_compressor
+                try:
+                    _turn_activity_parts = []
+                    if final_response and isinstance(final_response, str) and final_response.strip():
+                        _turn_activity_parts.append(f"Final response: {final_response[:2000]}")
+                    # Include any tool results that were part of this turn
+                    for msg in reversed(messages[-15:]):
+                        if isinstance(msg, dict) and msg.get("role") == "tool":
+                            _turn_activity_parts.append(
+                                f"Result [{msg.get('name', 'unknown')}]: {msg.get('content', '')[:1000]}"
+                            )
+                    if _turn_activity_parts:
+                        _compressor.update_context_doc(
+                            "\n".join(_turn_activity_parts),
+                            focus_topic=focus_topic if 'focus_topic' in locals() else None,
+                        )
+                except Exception as _ctx_err:
+                    logger.debug("Context doc update at turn end failed (non-fatal): %s", _ctx_err)
+
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
@@ -4486,6 +4609,18 @@ def run_conversation(
                 # Append as assistant so the history stays valid for
                 # session resume (avoids consecutive user messages).
                 messages.append({"role": "assistant", "content": final_response})
+
+                # Update context_doc with the error before breaking.
+                _compressor = getattr(agent, "context_compressor", None)
+                if _compressor is not None and hasattr(_compressor, "update_context_doc"):
+                    try:
+                        _compressor.update_context_doc(
+                            f"Error (near max iterations): {final_response}",
+                            focus_topic=focus_topic if 'focus_topic' in locals() else None,
+                        )
+                    except Exception as _ctx_err:
+                        logger.debug("Context doc update on near-limit error failed (non-fatal): %s", _ctx_err)
+
                 break
     
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
