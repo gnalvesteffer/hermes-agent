@@ -2808,13 +2808,29 @@ This compaction should PRIORITISE preserving all information related to the focu
             if rough_tokens < self.intra_turn_context_threshold:
                 return messages
 
-        # Determine how many recent messages to protect (user + assistant pairs).
+        # Determine how many recent messages to protect.
         n_messages = len(messages)
-        recent_count = min(self.rolling_summary_recent_n * 2, n_messages - 1)
-        if recent_count < 2:
-            recent_count = 2
 
-        split_idx = max(0, n_messages - recent_count)
+        if current_iteration > 0:
+            # Intra-turn: protect the entire last assistant turn (assistant + its
+            # tool results). Walk backward from the end to find where the most
+            # recent assistant message starts — everything from that point onward
+            # is part of the active intra-turn and must stay intact so the agent
+            # doesn't forget what it already did or repeat tool calls.
+            last_assistant_idx = -1
+            for i in range(n_messages - 1, -1, -1):
+                if messages[i].get("role") == "assistant":
+                    last_assistant_idx = i
+                    break
+            # Protect everything from the last assistant block onward.
+            split_idx = max(0, last_assistant_idx) if last_assistant_idx >= 0 else 0
+        else:
+            # Turn-boundary: protect recent user+assistant pairs by count.
+            recent_count = min(self.rolling_summary_recent_n * 2, n_messages - 1)
+            if recent_count < 2:
+                recent_count = 2
+            split_idx = max(0, n_messages - recent_count)
+
         old_messages = [m for m in messages[:split_idx] if m.get("role") != "system"]
         recent_messages = messages[split_idx:]
 
@@ -2853,6 +2869,9 @@ This compaction should PRIORITISE preserving all information related to the focu
             "## Active Task\n[Most recent unfulfilled user input]\n\n"
             "## Goal\n[Overall objective]\n\n"
             "## Key Decisions\n[Important technical decisions and why]\n\n"
+            "## Actions Already Taken\n[List completed actions — do NOT repeat these. "
+            "Include tool calls made, files read/written, commands run, and their outcomes.]"
+            "\n\n"
             "## Current State\n[Working directory, branch, modified files, running processes]"
         )
 
@@ -2864,6 +2883,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "Update the rolling summary. PRESERVE all still-relevant information. "
                 "ADD new completed actions and decisions. Remove only clearly obsolete items. "
                 "CRITICAL: Update 'Active Task' to reflect the most recent unfulfilled input.\n\n"
+                "IMPORTANT: In 'Actions Already Taken', list every tool call, file operation, "
+                "and command that was executed — include outcomes (exit codes, line counts). "
+                "This prevents repeating work. Never omit a completed action.\n\n"
                 f"Use this structure:\n\n{_sections}\n\n"
                 f"Target ~{self.rolling_summary_max_tokens} tokens max. Keep it brief."
             )
@@ -2873,6 +2895,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                 f"TURNS TO SUMMARIZE:\n{old_text}\n\n"
                 "Create a concise running context checkpoint. Use this structure:\n\n"
                 f"{_sections}\n\n"
+                "IMPORTANT: In 'Actions Already Taken', list every tool call, file operation, "
+                "and command that was executed — include outcomes (exit codes, line counts). "
+                "This prevents repeating work. Never omit a completed action.\n\n"
                 f"Target ~{self.rolling_summary_max_tokens} tokens max. Keep it brief."
             )
 
