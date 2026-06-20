@@ -2863,14 +2863,24 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "past-tense facts. Never leave finished work worded as still pending.\n\n"
             )
 
-        # Lightweight template — only the sections needed for continuity.
-        # Much shorter than overflow compression (~250 vs ~500+ tokens).
+        # Richer template — preserves concrete working detail so the agent can
+        # resume without re-doing work or losing tool outputs.  Still shorter than
+        # overflow compression (~350 vs ~500+ tokens).
         _sections = (
             "## Active Task\n[Most recent unfulfilled user input]\n\n"
             "## Goal\n[Overall objective]\n\n"
             "## Key Decisions\n[Important technical decisions and why]\n\n"
-            "## Actions Already Taken\n[List completed actions — do NOT repeat these. "
-            "Include tool calls made, files read/written, commands run, and their outcomes.]"
+            "## Files Being Edited\n[File paths, what was changed — include diffs or "
+            "describe the specific lines/functions modified. Do NOT omit file paths.]"
+            "\n\n"
+            "## Tool Results\n[Actual outputs from tool calls: commands run with exit codes, "
+            "files read (path + line count), search results (match counts + key matches). "
+            "Preserve concrete data — do not summarize away actual content.]"
+            "\n\n"
+            "## Errors/Blockers\n[Any errors encountered, things that failed, workarounds tried.]"
+            "\n\n"
+            "## Actions Already Taken\n[List every completed action — tool calls, file ops, "
+            "commands run, with outcomes. Do NOT repeat these. Never omit a completed action.]"
             "\n\n"
             "## Current State\n[Working directory, branch, modified files, running processes]"
         )
@@ -2883,11 +2893,13 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "Update the rolling summary. PRESERVE all still-relevant information. "
                 "ADD new completed actions and decisions. Remove only clearly obsolete items. "
                 "CRITICAL: Update 'Active Task' to reflect the most recent unfulfilled input.\n\n"
-                "IMPORTANT: In 'Actions Already Taken', list every tool call, file operation, "
-                "and command that was executed — include outcomes (exit codes, line counts). "
-                "This prevents repeating work. Never omit a completed action.\n\n"
+                "PRESERVATION RULES — do NOT lose working detail:\n"
+                "- Keep file paths, code snippets, function names, line numbers.\n"
+                "- Keep actual tool outputs (command results, search matches, file contents).\n"
+                "- Keep error messages and what was tried to fix them.\n"
+                "- In 'Actions Already Taken', list every completed action with outcomes.\n\n"
                 f"Use this structure:\n\n{_sections}\n\n"
-                f"Target ~{self.rolling_summary_max_tokens} tokens max. Keep it brief."
+                f"Target ~{self.rolling_summary_max_tokens} tokens max."
             )
         else:
             prompt = (
@@ -2895,10 +2907,12 @@ This compaction should PRIORITISE preserving all information related to the focu
                 f"TURNS TO SUMMARIZE:\n{old_text}\n\n"
                 "Create a concise running context checkpoint. Use this structure:\n\n"
                 f"{_sections}\n\n"
-                "IMPORTANT: In 'Actions Already Taken', list every tool call, file operation, "
-                "and command that was executed — include outcomes (exit codes, line counts). "
-                "This prevents repeating work. Never omit a completed action.\n\n"
-                f"Target ~{self.rolling_summary_max_tokens} tokens max. Keep it brief."
+                "PRESERVATION RULES — do NOT lose working detail:\n"
+                "- Keep file paths, code snippets, function names, line numbers.\n"
+                "- Keep actual tool outputs (command results, search matches, file contents).\n"
+                "- Keep error messages and what was tried to fix them.\n"
+                "- In 'Actions Already Taken', list every completed action with outcomes.\n\n"
+                f"Target ~{self.rolling_summary_max_tokens} tokens max."
             )
 
         # Call LLM for summarization
