@@ -146,6 +146,12 @@ _SUMMARY_RATIO = 0.20
 # Absolute ceiling for summary tokens (even on very large context windows)
 _SUMMARY_TOKENS_CEILING = 12_000
 
+# Progressive summarization constants
+# Fraction of aux model context reserved for output + safety margin
+_PROGRESSIVE_CONTEXT_RESERVED_FRACTION = 0.30
+# Minimum chars per chunk to avoid excessive LLM calls on tiny models
+_MIN_CHUNK_CHARS = 500
+
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
@@ -972,6 +978,7 @@ Update the checkpoint using this structure (keep it concise):
         rolling_summary_max_tokens: int | None = None,
         intra_turn_min_iterations: int = 3,
         intra_turn_context_threshold: int | None = None,
+        aux_context_length: int | None = None,
     ):
         self.model = model
         self.base_url = base_url
@@ -1086,6 +1093,12 @@ Update the checkpoint using this structure (keep it concise):
         # succeeded.  Silent recovery would hide the broken config.
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
+
+        # Context length of the auxiliary compression model (if known).
+        # Used by progressive summarization to decide whether chunking is needed.
+        # Set from agent_init.py via aux_context_length parameter; None means
+        # unknown and single-shot path will be used with runtime detection.
+        self._aux_context_length: Optional[int] = aux_context_length
 
         # ── Single-context document fields (new model) ────────────────
         # context_doc is a single string that summarizes all prior work.
@@ -1417,6 +1430,576 @@ Update the checkpoint using this structure (keep it concise):
 
         return "\n\n".join(parts)
 
+    # ------------------------------------------------------------------
+    # Progressive summarization — chunk → summarize each → merge
+    # ------------------------------------------------------------------
+
+    def _needs_progressive_summarization(self, serialized_text: str) -> bool:
+        """Check whether the serialized content exceeds the aux model's context.
+
+        Returns True when progressive (multi-pass) summarization is needed
+        because the single-shot prompt would overflow the auxiliary model's
+        context window.
+
+        Uses ``self._aux_context_length`` if known; otherwise estimates from
+        the main model's context as a proxy and falls back to runtime detection.
+        """
+        aux_ctx = self._aux_context_length
+        if aux_ctx is None:
+            # Unknown — defer to runtime: try single-shot first, detect overflow.
+            return False
+
+        # Estimate prompt overhead (preamble + template sections ~1200 chars)
+        _PROMPT_OVERHEAD_CHARS = 1200
+        usable_chars = int(aux_ctx * _CHARS_PER_TOKEN * (1 - _PROGRESSIVE_CONTEXT_RESERVED_FRACTION))
+        return len(serialized_text) > usable_chars - _PROMPT_OVERHEAD_CHARS
+
+    def _chunk_turns_for_summary(
+        self,
+        turns: List[Dict[str, Any]],
+        serialized_text: str,
+    ) -> List[tuple]:  # list of (chunk_serialized_str, chunk_turns_list)
+        """Split serialized turns into chunks that fit within aux model context.
+
+        Splits at turn boundaries to keep related content together. Each chunk
+        is sized so its serialized form fits comfortably within the aux model's
+        usable context window.
+
+        Returns a list of (chunk_serialized_text, chunk_turns) tuples.
+        """
+        if len(turns) <= 1:
+            return [(serialized_text, turns)]
+
+        aux_ctx = self._aux_context_length
+        if aux_ctx is None:
+            # Unknown context — use a heuristic based on main model's context
+            aux_ctx = max(self.context_length // 4, 8000)
+
+        # Target chars per chunk: leave room for prompt overhead + output
+        _PROMPT_OVERHEAD_CHARS = 1200
+        usable_chars = int(aux_ctx * _CHARS_PER_TOKEN * (1 - _PROGRESSIVE_CONTEXT_RESERVED_FRACTION))
+        target_chunk_chars = max(
+            _MIN_CHUNK_CHARS,
+            min(usable_chars - _PROMPT_OVERHEAD_CHARS, len(serialized_text)),
+        )
+
+        # Split serialized text into chunks at turn boundaries.
+        # Each turn starts with "[ROLE]:" or "[TOOL RESULT ...]:"
+        _TURN_BOUNDARY_RE = re.compile(r"^\[(?:TOOL RESULT|ASSISTANT|USER|system)\]")
+
+        lines = serialized_text.split("\n\n")
+        chunks: List[str] = []
+        current_chunk_lines: List[str] = []
+        current_len = 0
+
+        for line in lines:
+            if not line.strip():
+                continue
+            # Check if this line starts a new turn boundary
+            is_turn_start = bool(_TURN_BOUNDARY_RE.match(line))
+            line_len = len(line) + 2  # +2 for \n\n separator
+
+            if current_chunk_lines and current_len + line_len > target_chunk_chars:
+                # Flush current chunk
+                chunks.append("\n\n".join(current_chunk_lines))
+                current_chunk_lines = [line] if is_turn_start else []
+                current_len = len(line) + 2 if is_turn_start else 0
+            else:
+                current_chunk_lines.append(line)
+                current_len += line_len
+
+        if current_chunk_lines:
+            chunks.append("\n\n".join(current_chunk_lines))
+
+        # If we somehow got a single huge chunk, force-split it
+        if len(chunks) == 1 and len(chunks[0]) > target_chunk_chars * 2:
+            return self._force_split_chunks(chunks[0], turns)
+
+        # Map chunks back to their original turns by matching serialized forms
+        result = []
+        turn_idx = 0
+        for chunk_text in chunks:
+            chunk_turns = []
+            while turn_idx < len(turns):
+                test_serialized = self._serialize_single_turn(turns[turn_idx])
+                if test_serialized in chunk_text or (chunk_turns and not _TURN_BOUNDARY_RE.match(chunk_text.split("\n\n")[0])):
+                    chunk_turns.append(turns[turn_idx])
+                    turn_idx += 1
+                else:
+                    break
+            # Fallback: assign remaining turns to last chunk if mapping failed
+            if not chunk_turns and result:
+                result[-1] = (result[-1][0], result[-1][1] + turns[turn_idx:])
+                turn_idx = len(turns)
+            else:
+                result.append((chunk_text, chunk_turns))
+
+        # If mapping failed entirely, just split turns evenly
+        if not result or any(len(ct) == 0 for _, ct in result):
+            return self._even_split_chunks(turns, serialized_text)
+
+        return result
+
+    def _serialize_single_turn(self, turn: Dict[str, Any]) -> str:
+        """Serialize a single conversation turn (same logic as _serialize_for_summary but one at a time)."""
+        role = turn.get("role", "unknown")
+        content = redact_sensitive_text(turn.get("content") or "")
+        content = _MEDIA_DIRECTIVE_RE.sub("[media attachment]", content)
+
+        if role == "tool":
+            tool_id = turn.get("tool_call_id", "")
+            if len(content) > self._CONTENT_MAX:
+                content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
+            return f"[TOOL RESULT {tool_id}]: {content}"
+
+        if role == "assistant":
+            if len(content) > self._CONTENT_MAX:
+                content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
+            tool_calls = turn.get("tool_calls", [])
+            if tool_calls:
+                tc_parts = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        fn = tc.get("function", {})
+                        name = fn.get("name", "?")
+                        args = redact_sensitive_text(fn.get("arguments", ""))
+                        if len(args) > self._TOOL_ARGS_MAX:
+                            args = args[:self._TOOL_ARGS_HEAD] + "..."
+                        tc_parts.append(f"  {name}({args})")
+                    else:
+                        fn = getattr(tc, "function", None)
+                        name = getattr(fn, "name", "?") if fn else "?"
+                        tc_parts.append(f"  {name}(...)")
+                content += "\n[Tool calls:\n" + "\n".join(tc_parts) + "\n]"
+            return f"[ASSISTANT]: {content}"
+
+        # User and other roles
+        if len(content) > self._CONTENT_MAX:
+            content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
+        return f"[{role.upper()}]: {content}"
+
+    def _force_split_chunks(self, serialized_text: str, turns: List[Dict[str, Any]]) -> List[tuple]:
+        """Force-split a single oversized chunk into smaller pieces."""
+        lines = serialized_text.split("\n\n")
+        chunks: List[List[str]] = [[]]
+        current_len = 0
+        _PROMPT_OVERHEAD_CHARS = 1200
+        aux_ctx = self._aux_context_length or max(self.context_length // 4, 8000)
+        usable_chars = int(aux_ctx * _CHARS_PER_TOKEN * (1 - _PROGRESSIVE_CONTEXT_RESERVED_FRACTION))
+        target_chunk_chars = max(_MIN_CHUNK_CHARS, usable_chars - _PROMPT_OVERHEAD_CHARS)
+
+        for line in lines:
+            if not line.strip():
+                continue
+            line_len = len(line) + 2
+            if current_len + line_len > target_chunk_chars and chunks[-1]:
+                chunks.append([line])
+                current_len = line_len
+            else:
+                chunks[-1].append(line)
+                current_len += line_len
+
+        # Map back to turns (best-effort)
+        result = []
+        for chunk_lines in chunks:
+            chunk_text = "\n\n".join(chunk_lines)
+            # Assign roughly equal number of turns per chunk
+            n_turns_per_chunk = max(1, len(turns) // len(chunks))
+            start_idx = min(len(result), len(turns))  # safety
+            result.append((chunk_text, []))
+
+        # If we couldn't map properly, just split turns evenly
+        if not result or all(len(ct) == 0 for _, ct in result):
+            return self._even_split_chunks(turns, serialized_text)
+        return result
+
+    def _even_split_chunks(self, turns: List[Dict[str, Any]], serialized_text: str) -> List[tuple]:
+        """Split turns evenly into chunks when boundary-based splitting fails."""
+        n = len(turns)
+        if n <= 1:
+            return [(serialized_text, turns)]
+
+        # Estimate number of chunks needed
+        aux_ctx = self._aux_context_length or max(self.context_length // 4, 8000)
+        _PROMPT_OVERHEAD_CHARS = 1200
+        usable_chars = int(aux_ctx * _CHARS_PER_TOKEN * (1 - _PROGRESSIVE_CONTEXT_RESERVED_FRACTION))
+        target_chunk_chars = max(_MIN_CHUNK_CHARS, usable_chars - _PROMPT_OVERHEAD_CHARS)
+
+        # Rough estimate: each turn serializes to ~500 chars on average
+        avg_turn_chars = len(serialized_text) / n if n > 0 else 500
+        estimated_chunks = max(2, int(len(serialized_text) / target_chunk_chars))
+        chunk_size = max(1, (n + estimated_chunks - 1) // estimated_chunks)
+
+        result = []
+        for i in range(0, n, chunk_size):
+            chunk_turns = turns[i:i + chunk_size]
+            chunk_serialized = self._serialize_for_summary(chunk_turns)
+            result.append((chunk_serialized, chunk_turns))
+
+        return result if result else [(serialized_text, turns)]
+
+    def _summarize_chunk(
+        self,
+        chunk_serialized: str,
+        prompt_template_parts: dict,
+        focus_topic: Optional[str] = None,
+        is_first: bool = False,
+        previous_summaries: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Summarize a single chunk of serialized turns.
+
+        This is the core LLM call for progressive summarization — it takes
+        a chunk's serialized text and produces a partial summary using the
+        same structured template as the full _generate_summary method.
+
+        Args:
+            chunk_serialized: Serialized turn text for this chunk only.
+            prompt_template_parts: Dict with keys like 'preamble', 'sections', etc.
+            focus_topic: Optional focus string for guided compression.
+            is_first: True if this is the first chunk (has previous summary context).
+            previous_summaries: List of partial summaries from earlier chunks (for merge pass).
+
+        Returns:
+            Partial summary string, or None on failure.
+        """
+        now = time.monotonic()
+        if now < self._summary_failure_cooldown_until:
+            logger.debug(
+                "Skipping chunk summary during cooldown (%.0fs remaining)",
+                self._summary_failure_cooldown_until - now,
+            )
+            return None
+
+        # Build the prompt for this chunk
+        preamble = prompt_template_parts.get("preamble", "")
+        sections = prompt_template_parts.get("sections", "")
+        temporal_rule = prompt_template_parts.get("temporal_anchoring", "")
+
+        if is_first and self._previous_summary:
+            # Iterative update path: include previous summary for continuity
+            user_content = (
+                f"{preamble}\n\n"
+                f"{temporal_rule}"
+                f"PREVIOUS SUMMARY (for iterative update):\n{self._previous_summary}\n\n"
+                f"NEW TURNS TO SUMMARIZE:\n{chunk_serialized}\n\n"
+                f"Produce an updated summary that incorporates the new turns while "
+                f"preserving important details from the previous summary. Merge "
+                f"duplicate information and update completed items.\n\n"
+                f"{sections}"
+            )
+        elif is_first:
+            # First chunk, no previous summary — full compression prompt
+            user_content = (
+                f"{preamble}\n\n"
+                f"{temporal_rule}"
+                f"CONVERSATION TURNS TO SUMMARIZE:\n{chunk_serialized}\n\n"
+                f"{sections}"
+            )
+        elif previous_summaries:
+            # Merge pass: combine partial summaries from earlier chunks
+            merged_so_far = "\n\n---\n\n".join(previous_summaries)
+            user_content = (
+                f"{preamble}\n\n"
+                f"You are merging multiple partial summaries into one cohesive summary.\n"
+                f"Here are the partial summaries produced by summarizing different chunks:\n\n"
+                f"PARTIAL SUMMARIES:\n{merged_so_far}\n\n"
+                f"Now produce a single unified summary that:\n"
+                f"- Preserves all important details from each partial summary\n"
+                f"- Removes duplicate information\n"
+                f"- Maintains the structured format (Active Task, Goal, Decisions, etc.)\n"
+                f"- Resolves any conflicts between summaries\n"
+                f"{sections}"
+            )
+        else:
+            # Middle chunk — summarize this portion independently
+            user_content = (
+                f"{preamble}\n\n"
+                f"{temporal_rule}"
+                f"CONVERSATION TURNS TO SUMMARIZE:\n{chunk_serialized}\n\n"
+                f"{sections}"
+            )
+
+        call_kwargs = {
+            "model": self.summary_model or self.model,
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "api_key": self.api_key,
+            "api_mode": self.api_mode,
+        }
+        if self.summary_model:
+            call_kwargs["model"] = self.summary_model
+
+        # Estimate budget for this chunk (proportional to its size)
+        chunk_tokens = estimate_messages_tokens_rough(
+            [{"role": "user", "content": chunk_serialized}]
+        )
+        summary_budget = max(_MIN_SUMMARY_TOKENS, int(chunk_tokens * _SUMMARY_RATIO))
+        call_kwargs["max_tokens"] = min(summary_budget, self.max_summary_tokens)
+
+        try:
+            response = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": user_content}],
+                **call_kwargs,
+            )
+            content = response.choices[0].message.content
+            if not isinstance(content, str):
+                content = str(content) if content else ""
+            # Redact sensitive text from the summary output too
+            summary = redact_sensitive_text(content.strip())
+            return self._with_summary_prefix(summary) if not is_first and previous_summaries else summary
+        except Exception as e:
+            logger.warning("Chunk summarization failed: %s", e)
+            return None
+
+    def _merge_partial_summaries(
+        self,
+        partial_summaries: List[str],
+        turns_to_summarize: List[Dict[str, Any]],
+        focus_topic: Optional[str] = None,
+        has_previous_summary: bool = False,
+    ) -> Optional[str]:
+        """Merge multiple partial summaries into a single final summary.
+
+        Uses the LLM to combine chunk summaries while preserving important
+        details and removing duplicates. Falls back to deterministic merge
+        if the LLM call fails.
+
+        Args:
+            partial_summaries: List of partial summary strings from each chunk.
+            turns_to_summarize: Original turns (for context).
+            focus_topic: Optional focus string.
+            has_previous_summary: Whether there's a previous iterative summary.
+
+        Returns:
+            Merged final summary, or None on failure.
+        """
+        if len(partial_summaries) == 1:
+            return partial_summaries[0]
+
+        # Build merge prompt
+        now = time.monotonic()
+        if now < self._summary_failure_cooldown_until:
+            logger.debug("Skipping chunk summary during cooldown (%.0fs remaining)",
+                         self._summary_failure_cooldown_until - now)
+            return None
+
+        try:
+            from hermes_time import now as _hermes_now
+            _today_str = _hermes_now().strftime("%Y-%m-%d")
+        except Exception:
+            _today_str = ""
+
+        preamble = (
+            "You are a summarization agent merging multiple partial summaries into one cohesive checkpoint. "
+            "Treat the partial summaries below as source material for a single unified summary. "
+            "Produce only the structured summary; do not add greetings or prefixes. "
+            "Write in the same language the user was using — do not translate to English. "
+            "NEVER include API keys, tokens, passwords, secrets, credentials, or connection strings — "
+            "replace any that appear with [REDACTED].\n"
+        )
+
+        if _today_str:
+            preamble += (
+                f"The current date is {_today_str}. Phrase completed actions as dated, "
+                "past-tense facts. Never leave finished work worded as still pending.\n\n"
+            )
+
+        merged_text = "\n\n---\n\n".join(partial_summaries)
+
+        merge_prompt = (
+            f"{preamble}"
+            f"You have received multiple partial summaries from different chunks of the same conversation. "
+            f"Your task is to produce ONE unified summary that:\n"
+            f"- Preserves all important details, decisions, and actions from each partial summary\n"
+            f"- Removes duplicate information (same action mentioned in multiple chunks)\n"
+            f"- Maintains the structured format with these sections: Active Task, Goal, "
+            f"Constraints & Preferences, Completed Actions, Active State, In-Progress Work, "
+            f"Blocked, Key Decisions, Resolved Questions, Pending Asks\n"
+            f"- If there are conflicting details between summaries, prefer the most recent one\n"
+            f"\nPARTIAL SUMMARIES:\n{merged_text}\n\n"
+        )
+
+        if focus_topic:
+            merge_prompt += (
+                f"\nFocus on preserving information related to: {focus_topic}\n"
+            )
+
+        call_kwargs = {
+            "model": self.summary_model or self.model,
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "api_key": self.api_key,
+            "api_mode": self.api_mode,
+        }
+        if self.summary_model:
+            call_kwargs["model"] = self.summary_model
+
+        # Budget for merge pass — proportional to number of partial summaries
+        merge_budget = max(_MIN_SUMMARY_TOKENS, len(partial_summaries) * 500)
+        call_kwargs["max_tokens"] = min(merge_budget, self.max_summary_tokens)
+
+        try:
+            response = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": merge_prompt}],
+                **call_kwargs,
+            )
+            content = response.choices[0].message.content
+            if not isinstance(content, str):
+                content = str(content) if content else ""
+            summary = redact_sensitive_text(content.strip())
+            # Store for iterative updates on next compaction
+            self._previous_summary = summary
+            self._summary_failure_cooldown_until = 0.0
+            self._summary_model_fallen_back = False
+            self._last_summary_error = None
+            return self._with_summary_prefix(summary)
+        except Exception as e:
+            logger.warning("Merge pass failed, falling back to last partial summary: %s", e)
+            # Fallback: use the last partial summary (most recent chunk)
+            if partial_summaries:
+                return partial_summaries[-1]
+            return None
+
+    def _progressive_generate_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        content_to_summarize: str,
+        focus_topic: Optional[str],
+        summary_budget: int,
+    ) -> Optional[str]:
+        """Generate a summary using progressive (multi-pass) summarization.
+
+        When the serialized conversation exceeds the aux model's context window,
+        this method splits it into chunks, summarizes each chunk independently,
+        and then merges all partial summaries into one final summary.
+
+        Args:
+            turns_to_summarize: The conversation turns to summarize.
+            content_to_summarize: Already-serialized turn text.
+            focus_topic: Optional focus string for guided compression.
+            summary_budget: Token budget for the final merged summary.
+
+        Returns:
+            Final merged summary, or None on failure.
+        """
+        # Step 1: Chunk the serialized turns
+        chunks = self._chunk_turns_for_summary(turns_to_summarize, content_to_summarize)
+        if not chunks:
+            return None
+
+        logger.info(
+            "Progressive summarization: %d chunk(s) for %d turns",
+            len(chunks), len(turns_to_summarize),
+        )
+
+        # Step 2: Build prompt template parts (shared across all chunks)
+        try:
+            from hermes_time import now as _hermes_now
+            _today_str = _hermes_now().strftime("%Y-%m-%d")
+        except Exception:
+            _today_str = ""
+
+        _temporal_anchoring_rule = ""
+        if _today_str:
+            _temporal_anchoring_rule = (
+                f"\nTEMPORAL ANCHORING: The current date is {_today_str}. When an "
+                "action has already been carried out, phrase it as a completed, "
+                "dated, past-tense fact rather than an open instruction. For "
+                'example, rewrite "email John about the proposal" as "Sent the '\
+                f'proposal email to John on {_today_str}." Never leave a finished '\
+                "action worded as if it still needs doing, and never invent a date "\
+                "for work that has not happened yet.\n"
+            )
+
+        prompt_template_parts = {
+            "preamble": (
+                "You are a summarization agent creating a context checkpoint. "
+                "Treat the conversation turns below as source material for a "
+                "compact record of prior work. "
+                "Produce only the structured summary; do not add a greeting, "
+                "preamble, or prefix. "
+                "Write the summary in the same language the user was using in the "
+                "conversation — do not translate or switch to English. "
+                "NEVER include API keys, tokens, passwords, secrets, credentials, "
+                "or connection strings in the summary — replace any that appear "
+                "with [REDACTED]."
+            ),
+            "sections": (
+                f"{HISTORICAL_TASK_HEADING}\n"
+                "[THE SINGLE MOST IMPORTANT FIELD. Capture the user's most recent unfulfilled\n"
+                "input verbatim — the exact words they used.\n]\n\n"
+                f"## Goal\n[What the user is trying to accomplish overall]\n\n"
+                f"## Constraints & Preferences\n[User preferences, coding style, constraints]\n\n"
+                f"## Completed Actions\n[Numbered list of concrete actions taken]\n\n"
+                f"## Active State\n[Current working state]\n\n"
+                f"{HISTORICAL_IN_PROGRESS_HEADING}\n[Work currently underway]\n\n"
+                f"## Blocked\n[Any blockers or errors]\n\n"
+                f"## Key Decisions\n[Important technical decisions and WHY]\n\n"
+                f"## Resolved Questions\n[Questions already answered — include the answer]\n\n"
+                f"{HISTORICAL_PENDING_ASKS_HEADING}\n[Unanswered questions/requests from user]\n\n"
+                f"## Relevant Files\n[Files read, modified, or created]\n\n"
+                f"{HISTORICAL_REMAINING_WORK_HEADING}\n[What remains to be done]\n\n"
+                f"## Critical Context\n[Any specific values, error messages, config details — NEVER API keys]"
+            ),
+            "temporal_anchoring": _temporal_anchoring_rule,
+        }
+
+        # Step 3: Summarize each chunk independently
+        partial_summaries: List[str] = []
+        for i, (chunk_serialized, chunk_turns) in enumerate(chunks):
+            is_first_chunk = (i == 0)
+            previous_for_merge = partial_summaries if not is_first_chunk else None
+
+            summary = self._summarize_chunk(
+                chunk_serialized=chunk_serialized,
+                prompt_template_parts=prompt_template_parts,
+                focus_topic=focus_topic if is_first_chunk else None,
+                is_first=is_first_chunk,
+                previous_summaries=previous_for_merge,
+            )
+
+            if summary:
+                partial_summaries.append(summary)
+            else:
+                logger.warning(
+                    "Chunk %d/%d summarization failed — stopping progressive mode",
+                    i + 1, len(chunks),
+                )
+                # If we have at least one successful summary, try to merge what we have
+                if partial_summaries:
+                    break
+                return None
+
+        # Step 4: Merge all partial summaries into one final summary
+        if not partial_summaries:
+            return None
+
+        if len(partial_summaries) == 1:
+            # Only one chunk — no merge needed, just return it
+            logger.info("Progressive summarization: single chunk, returning directly")
+            return self._with_summary_prefix(partial_summaries[0])
+
+        logger.info(
+            "Progressive summarization: merging %d partial summaries",
+            len(partial_summaries),
+        )
+
+        merged = self._merge_partial_summaries(
+            partial_summaries=partial_summaries,
+            turns_to_summarize=turns_to_summarize,
+            focus_topic=focus_topic,
+            has_previous_summary=bool(self._previous_summary),
+        )
+
+        if merged:
+            return self._with_summary_prefix(merged)
+
+        # Final fallback: use the last partial summary
+        logger.warning("Progressive summarization merge failed — using last chunk summary")
+        return self._with_summary_prefix(partial_summaries[-1])
+
     def _build_static_fallback_summary(
         self,
         turns_to_summarize: List[Dict[str, Any]],
@@ -1665,6 +2248,16 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
         summary_budget = self._compute_summary_budget(turns_to_summarize)
         content_to_summarize = self._serialize_for_summary(turns_to_summarize)
+
+        # Progressive summarization: if the serialized content exceeds the aux
+        # model's context window, split into chunks and summarize each one
+        # separately before merging. This enables compression on models with
+        # small context windows (e.g., 8K–32K) that would otherwise fail to
+        # fit the full conversation in a single summarization prompt.
+        if self._needs_progressive_summarization(content_to_summarize):
+            return self._progressive_generate_summary(
+                turns_to_summarize, content_to_summarize, focus_topic, summary_budget,
+            )
 
         # Current date for temporal anchoring (see ## Temporal Anchoring below).
         # Date-only granularity matches system_prompt.py:337 (PR #20451) and the

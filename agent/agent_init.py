@@ -1603,6 +1603,7 @@ def init_agent(
             rolling_summary_max_tokens=rolling_summary_max_tokens,
             intra_turn_min_iterations=intra_turn_min_iterations,
             intra_turn_context_threshold=intra_turn_context_threshold,
+            aux_context_length=getattr(agent, "_aux_compression_context_length", None),
         )
     agent.compression_enabled = compression_enabled
 

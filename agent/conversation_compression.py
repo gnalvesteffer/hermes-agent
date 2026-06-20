@@ -162,23 +162,39 @@ def check_compression_model_feasibility(agent: Any) -> None:
             custom_providers=agent._custom_providers,
         )
 
+        # Store aux context length on agent so ContextCompressor can use it
+        # for progressive summarization chunking decisions.
+        if aux_context:
+            agent._aux_compression_context_length = aux_context
+
         # Hard floor: the auxiliary compression model must have at least
-        # MINIMUM_CONTEXT_LENGTH (64K) tokens of context.  The main model
-        # is already required to meet this floor (checked earlier in
-        # __init__), so the compression model must too — otherwise it
-        # cannot summarise a full threshold-sized window of main-model
-        # content.  Mirrors the main-model rejection pattern.
+        # MINIMUM_CONTEXT_LENGTH (64K) tokens of context — UNLESS progressive
+        # summarization is available, in which case we can chunk and merge.
+        # Progressive mode needs a minimum to fit even a single chunk's prompt;
+        # 8K tokens (~32K chars with overhead) is the practical lower bound for
+        # structured summary generation on modern models.
+        _PROGRESSIVE_MIN_CONTEXT = 8_000
         if aux_context and aux_context < MINIMUM_CONTEXT_LENGTH:
-            raise ValueError(
-                f"Auxiliary compression model {aux_model} has a context "
-                f"window of {aux_context:,} tokens, which is below the "
-                f"minimum {MINIMUM_CONTEXT_LENGTH:,} required by Hermes "
-                f"Agent.  Choose a compression model with at least "
-                f"{MINIMUM_CONTEXT_LENGTH // 1000}K context (set "
-                f"auxiliary.compression.model in config.yaml), or set "
-                f"auxiliary.compression.context_length to override the "
-                f"detected value if it is wrong."
-            )
+            # Check if progressive summarization can handle this smaller model
+            # by chunking the content into pieces that fit within its context.
+            if aux_context >= _PROGRESSIVE_MIN_CONTEXT:
+                logger.info(
+                    "Auxiliary compression model %s has %d token context (below "
+                    "%d minimum), but progressive summarization can handle it via "
+                    "chunking — session will proceed with chunked compression.",
+                    aux_model, aux_context, MINIMUM_CONTEXT_LENGTH,
+                )
+            else:
+                raise ValueError(
+                    f"Auxiliary compression model {aux_model} has a context "
+                    f"window of {aux_context:,} tokens, which is below the "
+                    f"minimum {_PROGRESSIVE_MIN_CONTEXT:,} required by Hermes "
+                    f"Agent.  Choose a compression model with at least "
+                    f"{_PROGRESSIVE_MIN_CONTEXT // 1000}K context (set "
+                    f"auxiliary.compression.model in config.yaml), or set "
+                    f"auxiliary.compression.context_length to override the "
+                    f"detected value if it is wrong."
+                )
 
         threshold = agent.context_compressor.threshold_tokens
         if aux_context < threshold:
