@@ -14,6 +14,9 @@ Improvements over v2:
   - Tool output pruning before LLM summarization (cheap pre-pass)
   - Scaled summary budget (proportional to compressed content)
   - Richer tool call/result detail in summarizer input
+  - Progressive summarization: when serialized content exceeds the aux model's
+    context window, splits into chunks and merges partial summaries so models
+    with small context windows (8K–32K) can still compress large conversations.
 """
 
 import hashlib
@@ -39,6 +42,12 @@ HISTORICAL_IN_PROGRESS_HEADING = "## Historical In-Progress State"
 HISTORICAL_PENDING_ASKS_HEADING = "## Historical Pending User Asks"
 HISTORICAL_REMAINING_WORK_HEADING = "## Historical Remaining Work"
 
+
+# Progressive summarization constants. When serialized content exceeds the
+# auxiliary model's context window, we split into chunks and summarize
+# progressively. These values control chunk sizing and merge overhead.
+_PROGRESSIVE_CHUNK_HEADROOM_TOKENS = 2_048  # prompt + metadata headroom per chunk
+_PROGRESSIVE_MERGE_HEADROOM_TOKENS = 1_536  # extra room when merging summaries
 
 SUMMARY_PREFIX = (
     "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
@@ -683,6 +692,7 @@ class ContextCompressor(ContextEngine):
         provider: str = "",
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
+        aux_context_length: int | None = None,
     ):
         self.model = model
         self.base_url = base_url
@@ -705,6 +715,11 @@ class ContextCompressor(ContextEngine):
             config_context_length=config_context_length,
             provider=provider,
         )
+        # Auxiliary compression model's context window. When the serialized
+        # conversation to be summarized exceeds this window we fall back to
+        # progressive summarization (chunk → summarize → merge).  None means
+        # "not yet resolved" — will be set by agent_init.py or probed lazily.
+        self.aux_context_length = aux_context_length or self.context_length
         # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
         # the percentage would suggest a lower value.  This prevents premature
         # compression on large-context models at 50% while keeping the % sane
@@ -1085,6 +1100,220 @@ class ContextCompressor(ContextEngine):
             parts.append(f"[{role.upper()}]: {content}")
 
         return "\n\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Progressive summarization helpers
+    # ------------------------------------------------------------------
+
+    def _estimate_serialized_tokens(self, content: Optional[str]) -> int:
+        """Rough token estimate for serialized text (char / 4 heuristic)."""
+        if not content:
+            return 0
+        return max(1, len(content) // 4)
+
+    def _chunk_turns_for_summary(
+        self,
+        turns: List[Dict[str, Any]],
+        max_chunk_tokens: int,
+    ) -> List[List[Dict[str, Any]]]:
+        """Split conversation turns into chunks that fit within *max_chunk_tokens*.
+
+        Each chunk is sized so its serialized form (estimated via char/4) plus
+        prompt headroom stays under the limit.  When a single turn's content
+        exceeds the limit it is kept whole but flagged for truncation during
+        serialization.
+
+        Returns a list of turn-list chunks.
+        """
+        if len(turns) <= 1:
+            return [turns]
+
+        # Estimate serialized size per turn to find good chunk boundaries.
+        serialized = self._serialize_for_summary(turns)
+        total_est_tokens = self._estimate_serialized_tokens(serialized)
+
+        # If the whole thing fits, no need to chunk.
+        if total_est_tokens <= max_chunk_tokens:
+            return [turns]
+
+        # Binary-search for a good split point using cumulative serialized size.
+        chunks: List[List[Dict[str, Any]]] = []
+        current_chunk: List[Dict[str, Any]] = []
+        current_est_tokens = 0
+
+        for turn in turns:
+            # Estimate this turn's serialized token count.
+            turn_serialized = self._serialize_for_summary([turn])
+            turn_est = self._estimate_serialized_tokens(turn_serialized)
+
+            if current_chunk and (current_est_tokens + turn_est) > max_chunk_tokens:
+                chunks.append(current_chunk)
+                current_chunk = [turn]
+                current_est_tokens = turn_est
+            else:
+                current_chunk.append(turn)
+                current_est_tokens += turn_est
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        logger.info(
+            "Progressive summarization: %d turns split into %d chunks "
+            "(~%d tokens each, limit %d)",
+            len(turns), len(chunks),
+            total_est_tokens // max(len(chunks), 1),
+            max_chunk_tokens,
+        )
+        return chunks
+
+    def _summarize_chunk(
+        self,
+        chunk_content: str,
+        previous_summary: Optional[str] = None,
+    ) -> Optional[str]:
+        """Summarize a single chunk of serialized turns.
+
+        Uses the auxiliary compression model via ``call_llm(task='compression')``.
+        Returns the summary text or None on failure.
+        """
+        if previous_summary:
+            prompt = (
+                "You are a summarization agent updating a context checkpoint.\n"
+                "\n"
+                f"PREVIOUS CHUNK SUMMARY:\n{previous_summary}\n"
+                "\n"
+                f"NEW TURNS TO MERGE:\n{chunk_content}\n"
+                "\n"
+                "Update the previous summary by incorporating new information from "
+                "the turns above. Preserve existing details that are still relevant, "
+                "add new completed actions and decisions, and remove obsolete items. "
+                "Keep the same structure as before (Task, Goal, Constraints, Actions, "
+                "State, Decisions, Questions, Files). Be concise — this is an "
+                "intermediate summary that will be further compressed later.\n"
+                "\n"
+                "Write only the updated summary body. Do not include any preamble."
+            )
+        else:
+            prompt = (
+                "You are a summarization agent creating a context checkpoint for "
+                "a segment of conversation turns.\n\n"
+                f"TURNS TO SUMMARIZE:\n{chunk_content}\n\n"
+                "Create a concise structured summary capturing:\n"
+                "- The user's most recent unfulfilled request or question\n"
+                "- Key decisions and actions taken\n"
+                "- Important files, commands, and results\n"
+                "- Current state and any blockers\n\n"
+                "Be concrete — include file paths, command outputs, error messages. "
+                "Keep it brief; this is an intermediate summary.\n\n"
+                "Write only the summary body. Do not include any preamble."
+            )
+
+        try:
+            response = call_llm(
+                task="compression",
+                main_runtime={
+                    "model": self.model,
+                    "provider": self.provider,
+                    "base_url": self.base_url,
+                    "api_key": self.api_key,
+                    "api_mode": self.api_mode,
+                },
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=int(self.max_summary_tokens * 0.8),
+            )
+            content = response.choices[0].message.content
+            if not isinstance(content, str):
+                content = str(content) if content else ""
+            return redact_sensitive_text(content.strip())
+        except Exception as e:
+            logger.warning(
+                "Progressive summarization chunk failed: %s", e, exc_info=True,
+            )
+            return None
+
+    def _progressive_generate_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        focus_topic: Optional[str] = None,
+    ) -> Optional[str]:
+        """Generate a summary using progressive (chunked) summarization.
+
+        When the serialized conversation exceeds the auxiliary model's context
+        window, split it into chunks, summarize each independently, then merge
+        partial summaries iteratively. This enables compaction on models with
+        8K–32K context windows that would otherwise fail to fit a full
+        conversation in a single summarization prompt.
+
+        Algorithm:
+          1. Serialize turns and estimate token count
+          2. If within aux window → delegate to _generate_summary() (fast path)
+          3. Otherwise, split into chunks sized for the aux context window
+          4. Summarize first chunk → iterative merge with each subsequent chunk
+          5. Wrap result in standard summary prefix
+
+        Returns None if all attempts fail.
+        """
+        content_to_summarize = self._serialize_for_summary(turns_to_summarize)
+        est_tokens = self._estimate_serialized_tokens(content_to_summarize)
+
+        # Effective aux context window: use the configured value, or probe it.
+        aux_window = getattr(self, "aux_context_length", None)
+        if not aux_window:
+            # Try to resolve from config; fall back to main model's window.
+            try:
+                aux_model = self.summary_model or self.model
+                aux_base_url = self.base_url
+                aux_provider = self.provider
+                aux_api_key = self.api_key
+                aux_window = get_model_context_length(
+                    aux_model, base_url=aux_base_url, api_key=aux_api_key,
+                    provider=aux_provider,
+                )
+            except Exception:
+                aux_window = self.context_length
+
+        # Reserve headroom for the prompt itself (system message, instructions).
+        effective_limit = max(1024, int(aux_window * 0.85)) - _PROGRESSIVE_CHUNK_HEADROOM_TOKENS
+
+        if est_tokens <= effective_limit:
+            # Content fits — use standard summarization (fast path).
+            logger.debug(
+                "Serialized content (%d est tokens) fits within aux window "
+                "(%d), using direct summarization",
+                est_tokens, effective_limit + _PROGRESSIVE_CHUNK_HEADROOM_TOKENS,
+            )
+            return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+
+        # Progressive path: chunk → summarize → merge.
+        logger.info(
+            "Serialized content (%d est tokens) exceeds aux window limit "
+            "(%d), using progressive summarization",
+            est_tokens, effective_limit + _PROGRESSIVE_CHUNK_HEADROOM_TOKENS,
+        )
+
+        chunks = self._chunk_turns_for_summary(turns_to_summarize, effective_limit)
+        if not chunks:
+            return None
+
+        # Summarize the first chunk.
+        first_chunk_content = self._serialize_for_summary(chunks[0])
+        summary = self._summarize_chunk(first_chunk_content)
+        if not summary:
+            logger.warning("First chunk summarization failed — aborting progressive path")
+            return None
+
+        # Iteratively merge remaining chunks.
+        for i, chunk in enumerate(chunks[1:], start=2):
+            chunk_content = self._serialize_for_summary(chunk)
+            merged = self._summarize_chunk(chunk_content, previous_summary=summary)
+            if not merged:
+                logger.warning(
+                    "Chunk %d summarization failed — keeping partial summary", i,
+                )
+                break
+            summary = merged
+
+        return self._with_summary_prefix(summary)
 
     def _build_static_fallback_summary(
         self,
@@ -2278,9 +2507,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 tail_msgs,
             )
 
-        # Phase 3: Generate structured summary
+        # Phase 3: Generate structured summary (with progressive summarization support).
+        # When serialized content exceeds the auxiliary model's context window,
+        # _progressive_generate_summary splits into chunks and merges partial summaries.
         summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
-        summary = self._generate_summary(turns_to_summarize, focus_topic=summary_focus_topic)
+        summary = self._progressive_generate_summary(turns_to_summarize, focus_topic=summary_focus_topic)
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):

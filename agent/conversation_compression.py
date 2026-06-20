@@ -155,6 +155,12 @@ def check_compression_model_feasibility(agent: Any) -> None:
             custom_providers=agent._custom_providers,
         )
 
+        # Store on the compressor so progressive summarization can use it
+        # without re-probing.  The attribute is optional — if set to None
+        # (e.g. before feasibility check runs) _progressive_generate_summary
+        # falls back to lazy probing.
+        agent.context_compressor.aux_context_length = aux_context
+
         # Hard floor: the auxiliary compression model must have at least
         # MINIMUM_CONTEXT_LENGTH (64K) tokens of context.  The main model
         # is already required to meet this floor (checked earlier in
