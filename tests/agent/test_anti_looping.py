@@ -25,7 +25,161 @@ def _assistant(
     return msg
 
 
-# ── Tests ────────────────────────────────────────────────────────────────────
+# ── Intra-message tests (trigram-based near-duplicate detection) ─────────────
+
+
+class TestIntraMessageLoop:
+    """Cases where a loop exists within a SINGLE message's reasoning."""
+
+    def test_exact_repeat_paragraphs(self):
+        """Identical paragraphs repeated should trigger."""
+        paragraph = "Actually, thinking about this more carefully: when looking straight ahead horizontally, all trajectory points would naturally project to nearly the same screen X coordinate since they are aligned along your line of sight"
+        msgs = [_assistant(reasoning="\n\n".join([paragraph] * 4))]
+        assert check_for_thinking_loop(msgs) is not None
+
+    def test_near_duplicate_paragraphs(self):
+        """Paragraphs differing by one word should trigger (trigram overlap ~0.97)."""
+        msgs = [_assistant(
+            reasoning=(
+                "Actually, thinking about this more carefully: when looking "
+                "straight ahead horizontally, all trajectory points would "
+                "naturally project to nearly the same screen X coordinate"
+                "\n\n"
+                "Actually, thinking about this more carefully: when looking "
+                "straight ahead horizontally, all trajectory points would "
+                "naturally project to nearly the same screen Y coordinate"
+                "\n\n"
+                "Actually, thinking about this more carefuly: when looking "
+                "straight ahead horizontally, all trajectory points would "
+                "naturally project to nearly the same screen Z coordinate"
+            )
+        )]
+        assert check_for_thinking_loop(msgs) is not None
+
+    def test_no_intra_repeat(self):
+        """Distinct paragraphs should NOT trigger."""
+        msgs = [_assistant(
+            reasoning=(
+                "I think about trajectory and how it affects the game physics"
+                "\n\n"
+                "Looking at the database schema, I need to join three tables"
+                "\n\n"
+                "The API endpoint returns a JSON object with nested arrays"
+            )
+        )]
+        assert check_for_thinking_loop(msgs) is None
+
+    def test_single_paragraph_no_loop(self):
+        """A single paragraph can't loop."""
+        msgs = [_assistant(reasoning="just one paragraph")]
+        assert check_for_thinking_loop(msgs) is None
+
+
+# ── Inter-message tests (token overlap between consecutive messages) ─────────
+
+
+class TestInterMessageLoop:
+    """Cases where a loop spans multiple assistant messages."""
+
+    def test_exact_repeat_across_messages(self):
+        msgs = [
+            _assistant(
+                "Actually, thinking about this more carefully: when looking "
+                "straight ahead horizontally, all trajectory points would "
+                "naturally project to nearly the same screen X coordinate"
+            ),
+            _assistant(
+                "Actually, thinking about this more carefully: when looking "
+                "straight ahead horizontally, all trajectory points would "
+                "naturally project to nearly the same screen Y coordinate"
+            ),
+            _assistant(
+                "Actually, thinking about this more carefully: when looking "
+                "straight ahead horizontally, all trajectory points would "
+                "naturally project to nearly the same screen Z coordinate"
+            ),
+        ]
+        result = check_for_thinking_loop(msgs)
+        assert result is not None
+
+    def test_high_overlap(self):
+        """Similar but not identical reasoning should still trigger."""
+        msgs = [
+            _assistant(
+                "Actually, thinking about this more carefully: when looking "
+                "straight ahead horizontally, all trajectory points would "
+                "naturally project to nearly the same screen X coordinate"
+            ),
+            _assistant(
+                "Actually, thinking about this more carefully: when looking "
+                "straight ahead horizontally, all trajectory points would "
+                "naturally project to nearly the same screen Y coordinate"
+            ),
+            _assistant(
+                "Actually, thinking about this more carefully: when looking "
+                "straight ahead horizontally, all trajectory points would "
+                "naturally project to nearly the same screen Z coordinate"
+            ),
+        ]
+        result = check_for_thinking_loop(msgs)
+        assert result is not None
+
+    def test_consecutive_required_threshold(self):
+        """With consecutive_required=3, 2 repeats should NOT trigger."""
+        msgs = [
+            _assistant("I think about trajectory and physics"),
+            _assistant("I think about bullet drop and gravity"),
+        ]
+        result = check_for_thinking_loop(msgs, consecutive_required=3)
+        assert result is None
+
+    def test_nudge_message_content(self):
+        """The returned nudge should be the expected message."""
+        from agent import anti_looping
+        msgs = [
+            _assistant(
+                "Actually, thinking about this more carefully: when looking "
+                "straight ahead horizontally, all trajectory points would "
+                "naturally project to nearly the same screen X coordinate"
+            ),
+            _assistant(
+                "Actually, thinking about this more carefully: when looking "
+                "straight ahead horizontally, all trajectory points would "
+                "naturally project to nearly the same screen Y coordinate"
+            ),
+            _assistant(
+                "Actually, thinking about this more carefully: when looking "
+                "straight ahead horizontally, all trajectory points would "
+                "naturally project to nearly the same screen Z coordinate"
+            ),
+        ]
+        result = check_for_thinking_loop(msgs)
+        assert result == anti_looping._NUDGE_MESSAGE
+
+    def test_realistic_loop_pattern(self):
+        """Simulate the user's example of a model stuck in repetitive thinking."""
+        msgs = [
+            _assistant(
+                "Actually, thinking about this more carefully: when looking "
+                "straight ahead horizontally, all trajectory points would "
+                "naturally project to nearly the same screen X coordinate "
+                "since they are aligned along your line of sight"
+            ),
+            _assistant(
+                "Actually, thinking about this more carefully: when looking "
+                "straight ahead horizontally, all trajectory points would "
+                "naturally project to nearly the same screen X coordinate "
+                "since they are aligned along your line of sight"
+            ),
+            _assistant(
+                "Actually, thinking about this more carefully: when looking "
+                "straight ahead horizontally, all trajectory points would "
+                "naturally project to nearly the same screen X coordinate "
+                "since they are aligned along your line of sight"
+            ),
+        ]
+        result = check_for_thinking_loop(msgs)
+        assert result is not None
 
 
 class TestNoLoopDetected:
@@ -165,96 +319,6 @@ class TestNoLoopDetected:
                     "naturally project to nearly the same screen Z coordinate"
                 ),
             },
-        ]
-        result = check_for_thinking_loop(msgs)
-        assert result is not None
-
-
-class TestLoopDetected:
-    """Cases where a loop SHOULD be detected."""
-
-    def test_exact_repeat(self):
-        msgs = [
-            _assistant(
-                "Actually, thinking about this more carefully: when looking "
-                "straight ahead horizontally, all trajectory points would "
-                "naturally project to nearly the same screen X coordinate"
-            ),
-            _assistant(
-                "Actually, thinking about this more carefully: when looking "
-                "straight ahead horizontally, all trajectory points would "
-                "naturally project to nearly the same screen Y coordinate"
-            ),
-            _assistant(
-                "Actually, thinking about this more carefully: when looking "
-                "straight ahead horizontally, all trajectory points would "
-                "naturally project to nearly the same screen Z coordinate"
-            ),
-        ]
-        result = check_for_thinking_loop(msgs)
-        assert result is not None
-
-    def test_consecutive_required_threshold(self):
-        """With consecutive_required=3, 2 repeats should NOT trigger."""
-        msgs = [
-            _assistant(
-                "Actually, thinking about this more carefully: when looking "
-                "straight ahead horizontally, all trajectory points would "
-                "naturally project to nearly the same screen X coordinate"
-            ),
-            _assistant(
-                "Actually, thinking about this more carefully: when looking "
-                "straight ahead horizontally, all trajectory points would "
-                "naturally project to nearly the same screen Y coordinate"
-            ),
-        ]
-        result = check_for_thinking_loop(msgs, consecutive_required=3)
-        assert result is None
-
-    def test_nudge_message_content(self):
-        """The returned nudge should be the expected message."""
-        from agent import anti_looping
-        msgs = [
-            _assistant(
-                "Actually, thinking about this more carefully: when looking "
-                "straight ahead horizontally, all trajectory points would "
-                "naturally project to nearly the same screen X coordinate"
-            ),
-            _assistant(
-                "Actually, thinking about this more carefully: when looking "
-                "straight ahead horizontally, all trajectory points would "
-                "naturally project to nearly the same screen Y coordinate"
-            ),
-            _assistant(
-                "Actually, thinking about this more carefully: when looking "
-                "straight ahead horizontally, all trajectory points would "
-                "naturally project to nearly the same screen Z coordinate"
-            ),
-        ]
-        result = check_for_thinking_loop(msgs)
-        assert result == anti_looping._NUDGE_MESSAGE
-
-    def test_realistic_loop_pattern(self):
-        """Simulate the user's example of a model stuck in repetitive thinking."""
-        msgs = [
-            _assistant(
-                "Actually, thinking about this more carefully: when looking "
-                "straight ahead horizontally, all trajectory points would "
-                "naturally project to nearly the same screen X coordinate "
-                "since they are aligned along your line of sight"
-            ),
-            _assistant(
-                "Actually, thinking about this more carefully: when looking "
-                "straight ahead horizontally, all trajectory points would "
-                "naturally project to nearly the same screen X coordinate "
-                "since they are aligned along your line of sight"
-            ),
-            _assistant(
-                "Actually, thinking about this more carefully: when looking "
-                "straight ahead horizontally, all trajectory points would "
-                "naturally project to nearly the same screen X coordinate "
-                "since they are aligned along your line of sight"
-            ),
         ]
         result = check_for_thinking_loop(msgs)
         assert result is not None

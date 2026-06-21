@@ -5,11 +5,11 @@ similar reasoning/thinking content without taking action or making progress --
 this module detects it and returns a nudge message to break the cycle.
 
 Detection strategy:
-  - Walk backwards through recent assistant messages.
-  - Collect consecutive turns that have reasoning/thinking but no tool calls
-    and no visible text after think blocks.
-  - Compare token overlap between consecutive reasoning blocks.
-  - If overlap exceeds a threshold for N consecutive turns, declare a loop.
+  - Intra-message: split a single response's reasoning into paragraph blocks,
+    detect repeated/near-duplicate blocks using trigram overlap.
+  - Inter-message: walk backwards through recent assistant messages, compare
+    token overlap between consecutive reasoning blocks.
+  - If either check triggers, return the nudge message.
 
 The conversation loop in ``agent/conversation_loop.py`` calls
 ``check_for_thinking_loop()`` after an assistant message with no tool calls
@@ -24,15 +24,26 @@ from typing import Dict, List, Optional
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-# Number of consecutive turns to look back for repetition.
-_WINDOW_SIZE = 3
+# Number of consecutive turns to look back for inter-message repetition.
+_INTER_WINDOW_SIZE = 3
 
-# Token overlap ratio threshold (0.0-1.0). If the new reasoning shares this
-# fraction or more of tokens with any message in the window, it's a candidate.
-_OVERLAP_THRESHOLD = 0.65
+# Token overlap ratio threshold (0.0-1.0) for inter-message comparison.
+_INTER_OVERLAP_THRESHOLD = 0.65
 
-# Minimum consecutive matches to declare a loop.
-_CONSECUTIVE_MATCHES_REQUIRED = 2
+# Minimum consecutive matches to declare an inter-message loop.
+_INTER_CONSECUTIVE_MATCHES_REQUIRED = 2
+
+# Number of paragraph blocks to look back within a single message.
+_INTRA_WINDOW_SIZE = 4
+
+# Trigram overlap threshold for intra-message detection.
+# Trigrams catch near-duplicates much better than single-token Jaccard,
+# because "screen X coordinate" vs "screen Y coordinate" shares most
+# trigrams even though they differ by one word.
+_INTRA_OVERLAP_THRESHOLD = 0.5
+
+# Minimum consecutive intra-message matches to declare a loop.
+_INTRA_CONSECUTIVE_MATCHES_REQUIRED = 2
 
 # The nudge message injected when a loop is detected.
 _NUDGE_MESSAGE = (
@@ -49,6 +60,14 @@ def _tokenize(text: str) -> List[str]:
     return re.findall(r"[a-zA-Z0-9_]+|[^\w\s]", (text or "").lower())
 
 
+def _trigrams(text: str) -> List[str]:
+    """Generate character trigrams from text for near-duplicate detection."""
+    if not text:
+        return []
+    t = text.lower().strip()
+    return [t[i:i+3] for i in range(len(t) - 2)]
+
+
 def _token_overlap(tokens_a: List[str], tokens_b: List[str]) -> float:
     """Jaccard-like overlap between two token lists."""
     if not tokens_a or not tokens_b:
@@ -58,6 +77,26 @@ def _token_overlap(tokens_a: List[str], tokens_b: List[str]) -> float:
     intersection = len(set_a & set_b)
     union = len(set_a | set_b)
     return intersection / union if union > 0 else 0.0
+
+
+def _trigram_overlap(tris_a: List[str], tris_b: List[str]) -> float:
+    """Jaccard overlap between two trigram sets."""
+    if not tris_a or not tris_b:
+        return 0.0
+    set_a = set(tris_a)
+    set_b = set(tris_b)
+    intersection = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return intersection / union if union > 0 else 0.0
+
+
+def _split_paragraphs(text: str) -> List[str]:
+    """Split text into paragraph blocks (separated by blank lines)."""
+    if not text:
+        return []
+    # Split on double-newline or more, filter empty blocks.
+    blocks = re.split(r"\n{2,}", text)
+    return [b.strip() for b in blocks if b.strip()]
 
 
 def _extract_reasoning_from_message(msg: dict) -> Optional[str]:
@@ -89,20 +128,55 @@ def _extract_reasoning_from_message(msg: dict) -> Optional[str]:
     return None
 
 
+def _check_intra_message_loop(reasoning_text: str) -> bool:
+    """Check for repetition within a single reasoning block.
+
+    Splits the reasoning into paragraph blocks and checks if consecutive
+    blocks have high trigram overlap (catches near-duplicates that differ
+    by only a few words).
+
+    Returns True if a loop is detected within this message's reasoning.
+    """
+    paragraphs = _split_paragraphs(reasoning_text)
+    if len(paragraphs) < _INTRA_CONSECUTIVE_MATCHES_REQUIRED:
+        return False
+
+    consecutive_matches = 0
+    for i in range(1, len(paragraphs)):
+        tris_curr = set(_trigrams(paragraphs[i]))
+        tris_prev = set(_trigrams(paragraphs[i - 1]))
+        if not tris_curr or not tris_prev:
+            continue
+        overlap = _trigram_overlap(list(tris_curr), list(tris_prev))
+        if overlap >= _INTRA_OVERLAP_THRESHOLD:
+            consecutive_matches += 1
+            if consecutive_matches >= _INTRA_CONSECUTIVE_MATCHES_REQUIRED:
+                return True
+        else:
+            consecutive_matches = 0
+
+    return False
+
+
 def check_for_thinking_loop(
     messages: List[dict],
     *,
-    window_size: int = _WINDOW_SIZE,
-    overlap_threshold: float = _OVERLAP_THRESHOLD,
-    consecutive_required: int = _CONSECUTIVE_MATCHES_REQUIRED,
+    window_size: int = _INTER_WINDOW_SIZE,
+    overlap_threshold: float = _INTER_OVERLAP_THRESHOLD,
+    consecutive_required: int = _INTER_CONSECUTIVE_MATCHES_REQUIRED,
 ) -> Optional[str]:
     """Check if the recent conversation history shows a thinking loop.
 
-    Scans the last ``window_size`` assistant messages for repetitive reasoning
-    patterns.  Returns the nudge message string if a loop is detected, or
+    Performs two checks:
+      1. Intra-message: checks each assistant message's reasoning for
+         repeated paragraph blocks (near-duplicate detection via trigrams).
+      2. Inter-message: scans the last ``window_size`` assistant messages
+         for repetitive reasoning patterns using token overlap.
+
+    Returns the nudge message string if a loop is detected, or
     ``None`` otherwise.
 
-    Algorithm:
+    Algorithm (inter-message):
       1. Walk backwards through ``messages``, collecting consecutive assistant
          messages that have non-empty reasoning/thinking content but no tool
          calls and no visible text after think blocks.
@@ -123,6 +197,20 @@ def check_for_thinking_loop(
         The nudge message string if a thinking loop is detected, ``None``
         otherwise.
     """
+    # ── Intra-message check ────────────────────────────────────────────
+    # Check the most recent assistant message for repeated paragraphs
+    # within its own reasoning content.
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        reasoning = _extract_reasoning_from_message(msg)
+        if reasoning and _check_intra_message_loop(reasoning):
+            return _NUDGE_MESSAGE
+        break  # Only check the most recent assistant message
+
+    # ── Inter-message check ────────────────────────────────────────────
     # Collect recent assistant messages with reasoning but no tool calls.
     candidates: List[dict] = []
     for msg in reversed(messages):
