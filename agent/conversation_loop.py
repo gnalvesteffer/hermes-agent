@@ -570,6 +570,7 @@ def run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
+    anti_looping_nudge_count = 0  # Max nudges per turn to prevent infinite loops
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
@@ -4154,6 +4155,34 @@ def run_conversation(
                 
                 # Check if response only has think block with no actual content after it
                 if not agent._has_content_after_think_block(final_response):
+                    # ── Thinking-loop detection ─────────────────────
+                    # If the model keeps producing the same reasoning without
+                    # making progress, inject a nudge to break the cycle.
+                    _nudge = None
+                    try:
+                        from agent.anti_looping import check_for_thinking_loop
+                        _nudge = check_for_thinking_loop(messages)
+                    except Exception:
+                        pass  # Never let anti-looping break the loop
+                    if _nudge and anti_looping_nudge_count < 2:
+                        logger.info(
+                            "Thinking loop detected — injecting nudge message"
+                        )
+                        agent._buffer_status("⚠️ Model stuck in repetitive thinking — nudging to try a different approach")
+                        # Append the current assistant message first so the
+                        # sequence stays valid (assistant → user).
+                        interim_msg = agent._build_assistant_message(
+                            assistant_message, finish_reason
+                        )
+                        messages.append(interim_msg)
+                        messages.append({
+                            "role": "user",
+                            "content": _nudge,
+                            "_anti_looping_nudge": True,
+                        })
+                        anti_looping_nudge_count += 1
+                        continue
+
                     # ── Partial stream recovery ─────────────────────
                     # If content was already streamed to the user before
                     # the connection died, use it as the final response
@@ -4416,6 +4445,7 @@ def run_conversation(
                 # Reset retry counter/signature on successful content
                 agent._empty_content_retries = 0
                 agent._thinking_prefill_retries = 0
+                anti_looping_nudge_count = 0
                 # Successful content reached — drop any buffered retry
                 # status from earlier failed attempts in this turn.
                 agent._clear_status_buffer()
