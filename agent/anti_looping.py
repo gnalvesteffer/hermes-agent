@@ -68,6 +68,20 @@ def _trigrams(text: str) -> List[str]:
     return [t[i:i+3] for i in range(len(t) - 2)]
 
 
+def _word_ngrams(text: str, n: int = 4) -> List[str]:
+    """Generate word n-grams from text.
+
+    Uses lowercase words to catch repeated phrases like
+    'thinking about this more carefully' regardless of surrounding context.
+    """
+    if not text:
+        return []
+    words = re.findall(r"[a-zA-Z0-9_]+", (text or "").lower())
+    if len(words) < n:
+        return []
+    return [" ".join(words[i:i+n]) for i in range(len(words) - n + 1)]
+
+
 def _token_overlap(tokens_a: List[str], tokens_b: List[str]) -> float:
     """Jaccard-like overlap between two token lists."""
     if not tokens_a or not tokens_b:
@@ -90,12 +104,28 @@ def _trigram_overlap(tris_a: List[str], tris_b: List[str]) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+def _word_ngram_overlap(ng_a: List[str], ng_b: List[str]) -> float:
+    """Jaccard overlap between two word-n-gram sets."""
+    if not ng_a or not ng_b:
+        return 0.0
+    set_a = set(ng_a)
+    set_b = set(ng_b)
+    intersection = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return intersection / union if union > 0 else 0.0
+
+
 def _split_paragraphs(text: str) -> List[str]:
-    """Split text into paragraph blocks (separated by blank lines)."""
+    """Split text into paragraph blocks (separated by blank lines).
+
+    Handles both single-newline and double-newline separators to cover
+    different model output formats.
+    """
     if not text:
         return []
-    # Split on double-newline or more, filter empty blocks.
-    blocks = re.split(r"\n{2,}", text)
+    # Split on one or more blank lines (one or more consecutive newlines),
+    # filter empty blocks. This covers both \n\n and \n separators.
+    blocks = re.split(r"\n\s*\n", text)
     return [b.strip() for b in blocks if b.strip()]
 
 
@@ -131,9 +161,13 @@ def _extract_reasoning_from_message(msg: dict) -> Optional[str]:
 def _check_intra_message_loop(reasoning_text: str) -> bool:
     """Check for repetition within a single reasoning block.
 
-    Splits the reasoning into paragraph blocks and checks if consecutive
-    blocks have high trigram overlap (catches near-duplicates that differ
-    by only a few words).
+    Uses two complementary checks with word 4-grams (catches repeated phrases):
+      1. Consecutive overlap — catches near-duplicate adjacent paragraphs.
+      2. Average pairwise overlap — catches when many paragraphs share common
+         phrases even if no two consecutive pairs exceed the threshold.
+      3. Recurring sentence starters — detects models that keep restarting
+         with the same phrasing patterns (e.g., "Actually, thinking about",
+         "But wait", "Let me reconsider").
 
     Returns True if a loop is detected within this message's reasoning.
     """
@@ -141,19 +175,69 @@ def _check_intra_message_loop(reasoning_text: str) -> bool:
     if len(paragraphs) < _INTRA_CONSECUTIVE_MATCHES_REQUIRED:
         return False
 
+    # Build word 4-grams for each paragraph
+    paragraph_ngs = []
+    for p in paragraphs:
+        ng = set(_word_ngrams(p, n=4))
+        if ng:
+            paragraph_ngs.append(ng)
+
+    if not paragraph_ngs:
+        return False
+
+    # ── Check 1: consecutive word-ngram overlap ────────────────────────
     consecutive_matches = 0
-    for i in range(1, len(paragraphs)):
-        tris_curr = set(_trigrams(paragraphs[i]))
-        tris_prev = set(_trigrams(paragraphs[i - 1]))
-        if not tris_curr or not tris_prev:
-            continue
-        overlap = _trigram_overlap(list(tris_curr), list(tris_prev))
+    for i in range(1, len(paragraph_ngs)):
+        overlap = _word_ngram_overlap(
+            list(paragraph_ngs[i]), list(paragraph_ngs[i - 1])
+        )
         if overlap >= _INTRA_OVERLAP_THRESHOLD:
             consecutive_matches += 1
             if consecutive_matches >= _INTRA_CONSECUTIVE_MATCHES_REQUIRED:
                 return True
         else:
             consecutive_matches = 0
+
+    # ── Check 2: average pairwise word-ngram overlap ───────────────────
+    if len(paragraph_ngs) >= _INTRA_WINDOW_SIZE:
+        total_overlap = 0.0
+        pair_count = 0
+        for i in range(len(paragraph_ngs)):
+            for j in range(i + 1, len(paragraph_ngs)):
+                overlap = _word_ngram_overlap(
+                    list(paragraph_ngs[i]), list(paragraph_ngs[j])
+                )
+                total_overlap += overlap
+                pair_count += 1
+        if pair_count > 0:
+            avg_overlap = total_overlap / pair_count
+            if avg_overlap >= _INTRA_OVERLAP_THRESHOLD * 0.7:
+                return True
+
+    # ── Check 3: recurring sentence starters ───────────────────────────
+    # Models in a loop often restart with the same phrasing patterns.
+    # Detect repeated sentence-starting phrases across paragraphs.
+    _RECURRING_STARTERS = [
+        "actually, thinking about",
+        "but wait",
+        "let me reconsider",
+        "let me try",
+        "actually, i'm overcomplicating",
+        "actually, let me step back",
+        "i'm realizing this approach",
+    ]
+
+    starter_counts = {s: 0 for s in _RECURRING_STARTERS}
+    for p in paragraphs:
+        lower_p = p.lower()
+        for starter in _RECURRING_STARTERS:
+            if lower_p.startswith(starter) or lower_p.strip().startswith(starter):
+                starter_counts[starter] += 1
+
+    # If any recurring starter appears >= 2 times, it's a loop signal.
+    max_count = max(starter_counts.values()) if starter_counts else 0
+    if max_count >= 2:
+        return True
 
     return False
 

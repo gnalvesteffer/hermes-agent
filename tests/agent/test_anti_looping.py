@@ -74,6 +74,30 @@ class TestIntraMessageLoop:
         msgs = [_assistant(reasoning="just one paragraph")]
         assert check_for_thinking_loop(msgs) is None
 
+    def test_recurring_sentence_starters(self):
+        """Models in a loop restart with the same phrasing patterns."""
+        msgs = [_assistant(
+            reasoning=(
+                "But wait - I'm realizing this approach might not be what they want.\n\n"
+                "Actually, thinking about this more carefully: when looking straight ahead horizontally,\n"
+                "all trajectory points would naturally project to nearly the same screen X coordinate.\n\n"
+                "Let me try a different approach: instead of using camera forward as the primary direction.\n\n"
+                "But wait, that would mislead players about where their shots actually land."
+            )
+        )]
+        assert check_for_thinking_loop(msgs) is not None
+
+    def test_no_recurring_starters(self):
+        """Different sentence starters should NOT trigger."""
+        msgs = [_assistant(
+            reasoning=(
+                "I think about trajectory and how it affects the game physics.\n\n"
+                "Looking at the database schema, I need to join three tables.\n\n"
+                "The API endpoint returns a JSON object with nested arrays."
+            )
+        )]
+        assert check_for_thinking_loop(msgs) is None
+
 
 # ── Inter-message tests (token overlap between consecutive messages) ─────────
 
