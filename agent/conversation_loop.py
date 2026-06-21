@@ -4159,10 +4159,17 @@ def run_conversation(
                 # ── Thinking-loop detection (always run for non-tool-call responses) ──
                 # Detect repetitive thinking regardless of whether the model also
                 # produces some visible text — a looping model may output both.
+                # Build the assistant message FIRST so it can be passed to
+                # check_for_thinking_loop as current_message — without this,
+                # anti-looping only sees previous turns and misses intra-turn
+                # repetition (the bug that let Qwen3.x loop indefinitely).
+                _interim_msg = agent._build_assistant_message(
+                    assistant_message, finish_reason
+                )
                 _nudge = None
                 try:
                     from agent import anti_looping as _anti_looping_mod
-                    _nudge = check_for_thinking_loop(messages)
+                    _nudge = check_for_thinking_loop(messages, current_message=_interim_msg)
                 except Exception:
                     pass  # Never let anti-looping break the loop
                 if _nudge and anti_looping_nudge_count < 2:
@@ -4172,10 +4179,7 @@ def run_conversation(
                     agent._buffer_status("⚠️ Model stuck in repetitive thinking — nudging to try a different approach")
                     # Append the current assistant message first so the
                     # sequence stays valid (assistant → user).
-                    interim_msg = agent._build_assistant_message(
-                        assistant_message, finish_reason
-                    )
-                    messages.append(interim_msg)
+                    messages.append(_interim_msg)
                     messages.append({
                         "role": "user",
                         "content": _nudge,

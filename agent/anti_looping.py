@@ -300,6 +300,7 @@ def _check_intra_message_loop(reasoning_text: str) -> bool:
 def check_for_thinking_loop(
     messages: List[dict],
     *,
+    current_message: Optional[dict] = None,
     window_size: int = _INTER_WINDOW_SIZE,
     overlap_threshold: float = _INTER_OVERLAP_THRESHOLD,
     consecutive_required: int = _INTER_CONSECUTIVE_MATCHES_REQUIRED,
@@ -328,6 +329,11 @@ def check_for_thinking_loop(
     Args:
         messages: The full conversation message list (may contain assistant,
             user, tool, system messages).
+        current_message: Optional dict of the most recent assistant response
+            that has not yet been appended to ``messages``.  This allows
+            detection of loops within the current turn and between the
+            current turn and its predecessor — without it, anti-looping
+            only sees previous turns and misses intra-turn repetition.
         window_size: How many recent assistant messages to examine.
         overlap_threshold: Token overlap ratio required to count as a match.
         consecutive_required: Minimum consecutive matches to declare a loop.
@@ -336,10 +342,15 @@ def check_for_thinking_loop(
         The nudge message string if a thinking loop is detected, ``None``
         otherwise.
     """
+    # Prepend current_message so intra/inter checks see it too.
+    check_messages = list(messages)
+    if current_message and isinstance(current_message, dict):
+        check_messages.append(current_message)
+
     # ── Intra-message check ────────────────────────────────────────────
     # Check the most recent assistant message for repeated paragraphs
     # within its own reasoning content.
-    for msg in reversed(messages):
+    for msg in reversed(check_messages):
         if not isinstance(msg, dict):
             continue
         if msg.get("role") != "assistant":
@@ -352,7 +363,7 @@ def check_for_thinking_loop(
     # ── Inter-message check ────────────────────────────────────────────
     # Collect recent assistant messages with reasoning but no tool calls.
     candidates: List[dict] = []
-    for msg in reversed(messages):
+    for msg in reversed(check_messages):
         if len(candidates) >= window_size:
             break
         if not isinstance(msg, dict):
