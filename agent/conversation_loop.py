@@ -4154,34 +4154,37 @@ def run_conversation(
                 agent._mute_post_response = False
                 
                 # Check if response only has think block with no actual content after it
-                if not agent._has_content_after_think_block(final_response):
-                    # ── Thinking-loop detection ─────────────────────
-                    # If the model keeps producing the same reasoning without
-                    # making progress, inject a nudge to break the cycle.
-                    _nudge = None
-                    try:
-                        from agent.anti_looping import check_for_thinking_loop
-                        _nudge = check_for_thinking_loop(messages)
-                    except Exception:
-                        pass  # Never let anti-looping break the loop
-                    if _nudge and anti_looping_nudge_count < 2:
-                        logger.info(
-                            "Thinking loop detected — injecting nudge message"
-                        )
-                        agent._buffer_status("⚠️ Model stuck in repetitive thinking — nudging to try a different approach")
-                        # Append the current assistant message first so the
-                        # sequence stays valid (assistant → user).
-                        interim_msg = agent._build_assistant_message(
-                            assistant_message, finish_reason
-                        )
-                        messages.append(interim_msg)
-                        messages.append({
-                            "role": "user",
-                            "content": _nudge,
-                            "_anti_looping_nudge": True,
-                        })
-                        anti_looping_nudge_count += 1
-                        continue
+                _has_think_only = not agent._has_content_after_think_block(final_response)
+
+                # ── Thinking-loop detection (always run for non-tool-call responses) ──
+                # Detect repetitive thinking regardless of whether the model also
+                # produces some visible text — a looping model may output both.
+                _nudge = None
+                try:
+                    from agent import anti_looping as _anti_looping_mod
+                    _nudge = check_for_thinking_loop(messages)
+                except Exception:
+                    pass  # Never let anti-looping break the loop
+                if _nudge and anti_looping_nudge_count < 2:
+                    logger.info(
+                        "Thinking loop detected — injecting nudge message"
+                    )
+                    agent._buffer_status("⚠️ Model stuck in repetitive thinking — nudging to try a different approach")
+                    # Append the current assistant message first so the
+                    # sequence stays valid (assistant → user).
+                    interim_msg = agent._build_assistant_message(
+                        assistant_message, finish_reason
+                    )
+                    messages.append(interim_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": _nudge,
+                        "_anti_looping_nudge": True,
+                    })
+                    anti_looping_nudge_count += 1
+                    continue
+
+                if _has_think_only:
 
                     # ── Partial stream recovery ─────────────────────
                     # If content was already streamed to the user before
