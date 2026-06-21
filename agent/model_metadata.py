@@ -184,6 +184,13 @@ DEFAULT_FALLBACK_CONTEXT = CONTEXT_PROBE_TIERS[0]
 # Sessions, model switches, and cron jobs should reject models below this.
 MINIMUM_CONTEXT_LENGTH = 64_000
 
+# Minimum context length for the auxiliary compression model.  With progressive
+# summarization (chunk → summarize → merge), even models with as little as 8K
+# tokens can compress larger conversations by reading in chunks.  This is much
+# lower than MINIMUM_CONTEXT_LENGTH because the compression model only needs to
+# fit one chunk at a time, not the full conversation threshold.
+MINIMUM_COMPRESSION_MODEL_CONTEXT_LENGTH = 8_000
+
 # Thin fallback defaults — only broad model family patterns.
 # These fire only when provider is unknown AND models.dev/OpenRouter/Anthropic
 # all miss. Replaced the previous 80+ entry dict.

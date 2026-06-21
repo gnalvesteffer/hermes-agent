@@ -6,7 +6,8 @@ Three concerns live here:
   configured auxiliary compression model.  Warns when the aux context
   window can't fit the main model's compression threshold; auto-lowers
   the session threshold when possible; hard-rejects auxes below
-  ``MINIMUM_CONTEXT_LENGTH``.
+  ``MINIMUM_COMPRESSION_MODEL_CONTEXT_LENGTH`` (8K, lowered from 64K thanks
+  to progressive summarization).
 
 * :func:`replay_compression_warning` — re-emit a stored warning through
   the gateway ``status_callback`` once it's wired up (the callback is
@@ -94,6 +95,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
         )
         from agent.model_metadata import (
             MINIMUM_CONTEXT_LENGTH,
+            MINIMUM_COMPRESSION_MODEL_CONTEXT_LENGTH,
             get_model_context_length,
         )
 
@@ -161,19 +163,21 @@ def check_compression_model_feasibility(agent: Any) -> None:
         # falls back to lazy probing.
         agent.context_compressor.aux_context_length = aux_context
 
-        # Hard floor: the auxiliary compression model must have at least
-        # MINIMUM_CONTEXT_LENGTH (64K) tokens of context.  The main model
-        # is already required to meet this floor (checked earlier in
-        # __init__), so the compression model must too — otherwise it
-        # cannot summarise a full threshold-sized window of main-model
-        # content.  Mirrors the main-model rejection pattern.
-        if aux_context and aux_context < MINIMUM_CONTEXT_LENGTH:
+        # Floor: the auxiliary compression model must have at least
+        # MINIMUM_COMPRESSION_MODEL_CONTEXT_LENGTH (8K) tokens of context.
+        # With progressive summarization (chunk → summarize → merge), even
+        # models with as little as 8K can compress larger conversations by
+        # reading in chunks — they only need to fit one chunk at a time, not
+        # the full threshold-sized window.  The main model is already required
+        # to meet MINIMUM_CONTEXT_LENGTH (64K), so this lower floor for the
+        # compression model is safe.
+        if aux_context and aux_context < MINIMUM_COMPRESSION_MODEL_CONTEXT_LENGTH:
             raise ValueError(
                 f"Auxiliary compression model {aux_model} has a context "
                 f"window of {aux_context:,} tokens, which is below the "
-                f"minimum {MINIMUM_CONTEXT_LENGTH:,} required by Hermes "
+                f"minimum {MINIMUM_COMPRESSION_MODEL_CONTEXT_LENGTH:,} required by Hermes "
                 f"Agent.  Choose a compression model with at least "
-                f"{MINIMUM_CONTEXT_LENGTH // 1000}K context (set "
+                f"{MINIMUM_COMPRESSION_MODEL_CONTEXT_LENGTH // 1000}K context (set "
                 f"auxiliary.compression.model in config.yaml), or set "
                 f"auxiliary.compression.context_length to override the "
                 f"detected value if it is wrong."
@@ -182,9 +186,9 @@ def check_compression_model_feasibility(agent: Any) -> None:
         threshold = agent.context_compressor.threshold_tokens
         if aux_context < threshold:
             # Auto-correct: lower the live session threshold so
-            # compression actually works this session.  The hard floor
-            # above guarantees aux_context >= MINIMUM_CONTEXT_LENGTH,
-            # so the new threshold is always >= 64K.
+            # compression actually works this session.  The floor above
+            # guarantees aux_context >= MINIMUM_COMPRESSION_MODEL_CONTEXT_LENGTH,
+            # so the new threshold is always >= 8K.
             #
             # The compression summariser sends a single user-role
             # prompt (no system prompt, no tools) to the aux model, so
