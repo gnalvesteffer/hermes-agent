@@ -153,6 +153,12 @@ def _extract_reasoning_from_message(msg: dict) -> Optional[str]:
     XML-style tags).  Mirrors the extraction logic in
     ``agent.agent_runtime_helpers.extract_reasoning`` so that reasoning
     is found regardless of output format.
+
+    Fallback: if no structured reasoning field, no reasoning_content, and
+    no inline think blocks are present but the message has non-empty content
+    (and no tool calls), treat the entire content as potential reasoning.
+    This catches models like Qwen3.x via llama.cpp that emit reasoning as
+    plain text without any wrapping tags.
     """
     # Structured reasoning field (from API).
     reasoning = msg.get("reasoning") or ""
@@ -185,6 +191,23 @@ def _extract_reasoning_from_message(msg: dict) -> Optional[str]:
             len(rc),
         )
         return rc.strip()
+
+    # Fallback for models that emit reasoning as plain text without any
+    # wrapping tags (e.g. Qwen3.x via llama.cpp).  If there is no structured
+    # reasoning at all and the content looks like it could be reasoning
+    # rather than actionable output, treat it as such.  We only do this
+    # when the message has no tool calls — a model that actually produced
+    # useful output would typically include tool usage or a clear directive.
+    if isinstance(content, str) and content.strip():
+        # Only use untagged content as reasoning when there are no tool calls;
+        # otherwise we'd falsely treat normal assistant responses as reasoning.
+        has_tool_calls = msg.get("tool_calls")
+        if not has_tool_calls:
+            logger.debug(
+                "anti_loop: treating %d chars of untagged content as reasoning",
+                len(content),
+            )
+            return content.strip()
 
     logger.debug("anti_loop: no reasoning found in message keys=%s", list(msg.keys()))
     return None
@@ -340,9 +363,13 @@ def check_for_thinking_loop(
         if msg.get("tool_calls"):
             continue
         # Skip messages with visible content after think blocks -- the model
-        # actually produced something useful.
+        # actually produced something useful.  However, if there is no
+        # structured ``reasoning`` field at all, treat untagged content as
+        # potential reasoning (catches models like Qwen3.x via llama.cpp
+        # that emit reasoning as plain text without wrapping tags).
         content = msg.get("content") or ""
-        if isinstance(content, str) and content.strip():
+        has_structured_reasoning = bool(msg.get("reasoning"))
+        if isinstance(content, str) and content.strip() and has_structured_reasoning:
             # Quick check: does it have actual text outside think tags?
             stripped = re.sub(
                 r"</?(?:REASONING_SCRATCHPAD|think|reasoning)>",
