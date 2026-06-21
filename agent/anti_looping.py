@@ -115,6 +115,19 @@ def _word_ngram_overlap(ng_a: List[str], ng_b: List[str]) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+# Inline think-tag patterns used by various models/providers.
+# Mirrors the extraction logic in agent.agent_runtime_helpers.extract_reasoning()
+# so that _extract_reasoning_from_message finds reasoning regardless of format.
+_INLINE_THINK_PATTERNS = (
+    r"```(.*?)```",
+    r"</?think>",
+    r"<thinking>(.*?)</thinking>",
+    r"<thought>(.*?)</thought>",
+    r"<reasoning>(.*?)</reasoning>",
+    r"<REASONING_SCRATCHPAD>(.*?)</REASONING_SCRATCHPAD>",
+)
+
+
 def _split_paragraphs(text: str) -> List[str]:
     """Split text into paragraph blocks (separated by blank lines).
 
@@ -133,22 +146,24 @@ def _extract_reasoning_from_message(msg: dict) -> Optional[str]:
     """Extract reasoning text from an assistant message dict.
 
     Checks the structured ``reasoning`` field first, then falls back to
-    inline think blocks in ``content``.
+    inline think blocks in ``content`` (both markdown code fences and
+    XML-style tags).  Mirrors the extraction logic in
+    ``agent.agent_runtime_helpers.extract_reasoning`` so that reasoning
+    is found regardless of output format.
     """
     # Structured reasoning field (from API).
     reasoning = msg.get("reasoning") or ""
     if isinstance(reasoning, str) and reasoning.strip():
         return reasoning.strip()
 
-    # Inline think blocks in content.
+    # Inline think blocks in content — try all known tag formats.
     content = msg.get("content") or ""
     if isinstance(content, str):
-        think_blocks = re.findall(
-            r"```(.*?)```", content, flags=re.DOTALL
-        )
-        combined = "\n\n".join(b.strip() for b in think_blocks if b.strip())
-        if combined:
-            return combined
+        for pattern in _INLINE_THINK_PATTERNS:
+            blocks = re.findall(pattern, content, flags=re.DOTALL)
+            combined = "\n\n".join(b.strip() for b in blocks if b.strip())
+            if combined:
+                return combined
 
     # Structured reasoning_content field.
     rc = msg.get("reasoning_content") or ""
