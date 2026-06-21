@@ -18,8 +18,11 @@ but with thinking content is detected (no visible text after think blocks).
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -154,6 +157,10 @@ def _extract_reasoning_from_message(msg: dict) -> Optional[str]:
     # Structured reasoning field (from API).
     reasoning = msg.get("reasoning") or ""
     if isinstance(reasoning, str) and reasoning.strip():
+        logger.debug(
+            "anti_loop: extracted %d chars from 'reasoning' field",
+            len(reasoning),
+        )
         return reasoning.strip()
 
     # Inline think blocks in content — try all known tag formats.
@@ -163,13 +170,23 @@ def _extract_reasoning_from_message(msg: dict) -> Optional[str]:
             blocks = re.findall(pattern, content, flags=re.DOTALL)
             combined = "\n\n".join(b.strip() for b in blocks if b.strip())
             if combined:
+                logger.debug(
+                    "anti_loop: extracted %d chars from inline pattern '%s'",
+                    len(combined),
+                    pattern[:40],
+                )
                 return combined
 
     # Structured reasoning_content field.
     rc = msg.get("reasoning_content") or ""
     if isinstance(rc, str) and rc.strip():
+        logger.debug(
+            "anti_loop: extracted %d chars from 'reasoning_content' field",
+            len(rc),
+        )
         return rc.strip()
 
+    logger.debug("anti_loop: no reasoning found in message keys=%s", list(msg.keys()))
     return None
 
 
